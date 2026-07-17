@@ -6,13 +6,13 @@ I despise scammers who sell **low-quality firmware** at absurd prices.
 
 I also hate tutorials that deliberately skip the important parts, throw five screenshots at beginners, and then act like "change VID/DID" is firmware creation.
 
-That is exactly why this guide exists: to help you build your own **custom PCILeech DMA firmware** even if you have absolutely **zero experience**.
+I wrote this for people starting from zero who still want to build **custom PCILeech DMA firmware** properly. The missing details are why so many copied builds never get past Device Manager.
 
-> This version is intentionally **Windows-first**. Linux can be useful, but the main flow here does not require `lspci`, `setpci`, sysfs, or Linux BAR dumps.
+> **Windows is the main route here.** Linux is useful for deeper capture and validation, but the build does not depend on `lspci`, `setpci`, sysfs, or Linux BAR dumps.
 
 > This guide is intended for controlled lab use, hardware learning, interoperability testing, and security research. It is not a guide for bypassing access controls, anti-cheat systems, or protected environments.
 
-> If you already understand firmware creation, also study **[VoltCyclone/PCILeechFWGenerator](https://github.com/VoltCyclone/PCILeechFWGenerator)**. Automation is useful, but you still need to understand what it changes, or you will be stuck the first time something breaks.
+> If the basics are already familiar, study **[VoltCyclone/PCILeechFWGenerator](https://github.com/VoltCyclone/PCILeechFWGenerator)** too. Automation helps, but the first failure will still force you to understand every setting it touches.
 
 ---
 
@@ -43,7 +43,7 @@ That is exactly why this guide exists: to help you build your own **custom PCILe
 
 ## 1. Before You Start
 
-### 1.1 What This Guide Assumes
+### 1.1 What You Need
 
 You need:
 
@@ -56,9 +56,9 @@ You need:
 
 You do **not** need to be a PCIe expert yet. But you must stop thinking that firmware means "change two IDs and press build".
 
-### 1.2 What This Guide Is Actually Teaching
+### 1.2 What You Will Build
 
-By the end, you should understand how to:
+The work breaks down into:
 
 - capture donor data on Windows
 - set PCIe identity fields correctly
@@ -72,9 +72,9 @@ By the end, you should understand how to:
 - verify with Device Manager, Arbor, TeleScan PE, and cold boot
 - recover when the firmware fails
 
-### 1.3 What Counts as Success
+### 1.3 What Counts as a Working Build
 
-There are levels. Do not overstate the result.
+One clean Device Manager entry proves very little:
 
 | Level | Result | What it proves |
 |------|--------|----------------|
@@ -85,19 +85,13 @@ There are levels. Do not overstate the result.
 | 5 | BAR reads complete and return planned data | BAR response path works at least for tested offsets. |
 | 6 | Driver binds without Code 10/12/31 | BAR behavior, interrupts, PM, and config writes are good enough for that driver start path. |
 | 7 | Driver operates correctly under normal workload | Basic driver binding is not enough; the driver must survive realistic reads, writes, interrupts, resets, and normal use. |
-| 8 | Cold boot remains stable | Flash persistence and PCIe training are actually verified. |
+| 8 | Cold boot remains stable | Flash persistence and PCIe training survive a full power cycle. |
 
-If you only changed VID/DID, you made an incomplete prototype.
+VID/DID-only work is an incomplete prototype. One enumeration proves only that the endpoint trained and answered enough config reads to appear. Without readback, config behavior is still unknown; without a cold boot, flash persistence and link training are still untested.
 
-If Device Manager can see it once, that is not proof.
+### 1.4 Windows Is the Main Route
 
-If you did not do readback, you did not verify anything.
-
-If you did not cold boot, do not say the firmware is stable.
-
-### 1.4 Main Windows Rule
-
-This guide uses Windows as the main route:
+The normal toolchain is:
 
 - Device Manager
 - Arbor
@@ -111,11 +105,11 @@ This guide uses Windows as the main route:
 - OpenOCD on Windows
 - Vivado Hardware Manager
 
-Linux is optional. It is not required to complete this guide.
+Linux stays optional and appears later as an advanced capture and validation path.
 
 ### 1.5 Important Corrections Before You Waste a Weekend
 
-Read this table twice.
+Read this before buying hardware.
 
 | Bad advice from weak public guides | Correct answer |
 |------------------------------------|----------------|
@@ -128,9 +122,9 @@ Read this table twice.
 | "One flash command works for all boards." | No. Squirrel, CaptainDMA, Enigma, ZDMA, AC701, and other boards may use different tools. |
 | "Warm reboot is enough after flash." | No. Power off, remove power if needed, wait, power on, then verify. |
 
-### 1.6 Before You Move On
+### 1.6 Sanity Check
 
-You are ready to continue only when:
+Before buying parts or opening Vivado:
 
 - You accept that this is a Windows-first workflow
 - You have a real PCIe donor, not a USB device
@@ -231,14 +225,14 @@ You are looking for the programmer/update interface, not the PCIe endpoint:
 - Xilinx cable / Digilent cable
 - vendor-specific update interface
 
-Normal:
+The programmer side is ready when:
 
 ```text
 Programmer appears when the USB/update cable is connected.
 Flashing tool can list or open the programmer.
 ```
 
-Bad:
+Stop here if you get:
 
 ```text
 Unknown USB device
@@ -286,9 +280,9 @@ Cold boot exposes:
 
 Warm reboot lies. Cold boot tells the truth.
 
-### 2.6 Hardware Exit Check
+### 2.6 Hardware Ready Check
 
-You are ready when:
+Do not open the firmware project until these are sorted:
 
 - Board model is identified
 - FPGA part and package are identified
@@ -304,11 +298,9 @@ You are ready when:
 
 ## 3. Windows Donor Card Analysis
 
-### 3.1 What "Donor Capture" Means
+### 3.1 A Donor Capture Is More Than IDs
 
-Donor capture is not "I wrote down VID/DID".
-
-That is incomplete. That is why so many pasted firmwares break.
+Writing down VID/DID is not a donor capture. Firmware built from those two fields usually breaks as soon as Windows does anything beyond enumeration.
 
 Minimum Windows-only donor capture must include:
 
@@ -332,7 +324,7 @@ Minimum Windows-only donor capture must include:
 
 ### 3.2 Windows Capture Quality Levels
 
-Windows-only can absolutely complete this guide. But capture quality still has levels. Do not let a few screenshots pretend to be a raw dump.
+Windows tools provide enough data for the main workflow, but capture quality still varies. A few screenshots are not a raw dump.
 
 | Level | Name | What you have | Verdict |
 |------|------|---------------|---------|
@@ -341,7 +333,7 @@ Windows-only can absolutely complete this guide. But capture quality still has l
 | 2 | Decoded config | Arbor or TeleScan PE header/BAR/capability decode | Usable for beginner identity and BAR setup. |
 | 3 | Full Windows decode | BAR0-BAR5, standard capabilities, extended capabilities, MSI/MSI-X, DSN, driver version | Real Windows donor capture. |
 | 4 | Re-checkable raw-like data | Tool export, `.tlscan`, saved config bytes/table, or structured offset/DWORD file | Strong. You can regenerate COE and audit offsets. |
-| 5 | Donor-target diff ready | Donor and target records can be compared field by field | Best Windows route. This is what a serious guide should aim for. |
+| 5 | Donor-target diff ready | Donor and target records can be compared field by field | Preferred Windows route. |
 
 Straight answer:
 
@@ -350,7 +342,7 @@ Straight answer:
 - Level 2 can get you moving.
 - Level 3 is the minimum for a serious Windows-only tutorial.
 - Level 4 is where COE generation stops being guesswork.
-- Level 5 is where you can actually prove your firmware matches your plan.
+- Level 5 lets you compare the firmware against the donor plan field by field.
 
 ### 3.3 Create the Donor Folder First
 
@@ -413,7 +405,7 @@ Find the donor device, then capture:
 Right click device -> Properties -> Details -> Hardware Ids
 ```
 
-Normal output example:
+A complete Hardware IDs capture looks like:
 
 ```text
 PCI\VEN_10EC&DEV_8125&SUBSYS_012310EC&REV_05
@@ -433,7 +425,7 @@ Revision ID: 05
 Class Code: 020000
 ```
 
-Bad output:
+This is only a VID/DID capture:
 
 ```text
 PCI\VEN_10EC&DEV_8125
@@ -517,7 +509,7 @@ Record these fields:
 | MSI/MSI-X | MSI present, MSI-X absent | Writemask and BAR planning |
 | DSN | Present or absent | `cfg_dsn` and shadow data |
 
-Normal Arbor result:
+Arbor is giving useful data when:
 
 ```text
 Header decodes cleanly.
@@ -526,7 +518,7 @@ Capabilities chain walks forward and terminates.
 Extended capabilities are readable if present.
 ```
 
-Bad Arbor result:
+Treat this as a capture or tool failure:
 
 ```text
 Vendor ID: FFFF
@@ -563,7 +555,7 @@ Linux raw config dumps are convenient, but they are not mandatory for this Windo
 2. Export text if the tool supports it.
 3. Build an offset-based table from the exported data.
 4. Verify offsets with HxD or a script.
-5. Mark limitations honestly if you only have a partial capture.
+5. Record the limitation if the capture is partial.
 
 Acceptable Windows raw-like sources:
 
@@ -745,7 +737,7 @@ Template:
 
 ### 3.11 Donor-Target Diff Plan
 
-The final target must be compared against the donor. "Looks close" is not a diff.
+Compare the target against the donor. "Looks close" is not a diff.
 
 Use Windows tools:
 
@@ -772,9 +764,9 @@ Classify every difference:
 
 If you cannot classify a difference, do not hide it. Mark it unknown and investigate.
 
-### 3.12 Donor Capture Exit Check
+### 3.12 Review the Capture
 
-Donor capture is complete only when:
+A usable donor folder contains:
 
 - `donor_specs.md` is filled out
 - screenshots are saved
@@ -845,13 +837,13 @@ Verify:
 & "C:\Xilinx\Vivado\2023.2\bin\vivado.bat" -version
 ```
 
-Normal output:
+A working Vivado install prints:
 
 ```text
 Vivado v2023.2 ...
 ```
 
-Bad output:
+The path or version is wrong if you get:
 
 ```text
 The term 'C:\Xilinx\Vivado\2023.2\bin\vivado.bat' is not recognized
@@ -868,13 +860,13 @@ python --version
 pip --version
 ```
 
-Normal:
+Python is on PATH when you get:
 
 ```text
 Python 3.10.x
 ```
 
-Bad:
+Fix PATH if you see:
 
 ```text
 Python was not found
@@ -890,7 +882,7 @@ Verify:
 git --version
 ```
 
-Normal:
+Git should print:
 
 ```text
 git version 2.x.x.windows.x
@@ -900,7 +892,7 @@ git version 2.x.x.windows.x
 
 Use short ASCII-only paths.
 
-Good:
+Keep projects under paths like:
 
 ```text
 C:/dma/
@@ -910,7 +902,7 @@ C:/dma/donor/rtl8125/
 C:/dma/builds/
 ```
 
-Bad:
+Avoid paths like:
 
 ```text
 C:/Users/Your Name/Desktop/My DMA Firmware Test/
@@ -948,9 +940,9 @@ Common Windows driver problems:
 | Arbor cannot read config | Not admin, tool limitation, device not active |
 | TeleScan shows stale device | Rescan needed, device disabled, driver failed |
 
-### 4.8 Environment Exit Check
+### 4.8 Verify the Toolchain
 
-You are ready when:
+Check the toolchain once before cloning anything:
 
 - Vivado launches
 - 7 Series support is installed
@@ -994,7 +986,7 @@ Do not build CaptainDMA firmware inside the Squirrel folder unless your board ac
 
 ### 5.3 File Modification Map
 
-This table exists because old guides keep sending beginners to the wrong file.
+Old guides keep sending people to the wrong file. Use this map instead.
 
 | What you want to change | Where to change it |
 |-------------------------|--------------------|
@@ -1013,7 +1005,7 @@ This table exists because old guides keep sending beginners to the wrong file.
 | BAR routing / BAR responder | `src/pcileech_tlps128_bar_controller.sv` or board equivalent |
 | Generated PCIe core wrapper | `.gen/sources_1/ip/.../pcie_7x_0_core_top.v` if absolutely necessary |
 
-If a tutorial tells you to edit `rw[203]` in `pcileech_pcie_cfg_a7.sv`, it is wrong for current upstream-style projects.
+For current upstream-style projects, any tutorial putting `rw[203]` in `pcileech_pcie_cfg_a7.sv` is pointing at the wrong file.
 
 ### 5.4 Generate the Vivado Project - GUI Route
 
@@ -1026,7 +1018,7 @@ cd C:/dma/work/squirrel-rtl8125
 source vivado_generate_project.tcl -notrace
 ```
 
-Normal:
+A correctly generated project has:
 
 ```text
 Project opens.
@@ -1035,7 +1027,7 @@ PCIe IP appears.
 No fatal Tcl errors.
 ```
 
-Bad:
+These usually mean the folder, part, or path is wrong:
 
 ```text
 ERROR: file not found
@@ -1058,7 +1050,7 @@ Before customization:
 source vivado_build.tcl -notrace
 ```
 
-Normal:
+Baseline pass:
 
 ```text
 Synthesis completed
@@ -1067,7 +1059,7 @@ Bitstream generation completed
 Timing met
 ```
 
-Bad:
+Baseline failure:
 
 ```text
 Synthesis failed
@@ -1078,9 +1070,9 @@ Critical warning about wrong part or constraints
 
 Do not ignore timing and critical warnings. A `.bit` file existing is not enough.
 
-### 5.6 Stock Firmware Exit Check
+### 5.6 Keep the Stock Build as a Control
 
-Stock baseline is complete only when:
+Build and save the stock baseline before changing anything:
 
 - project generated
 - stock bitstream built
@@ -1183,13 +1175,13 @@ After changing IP:
 4. Watch the Messages window
 5. Save the `.xci` diff if using Git
 
-Normal:
+Regeneration succeeded:
 
 ```text
 IP output products generated successfully.
 ```
 
-Bad:
+Stop on any of these:
 
 ```text
 IP locked
@@ -1225,7 +1217,7 @@ If you must edit generated parameters such as extended capability pointers:
 - confirm the edit survived before bitstream generation
 - do not trust line numbers from another Vivado version
 
-Critical rule: files under `.gen` are not stable hand-written source. Vivado can replace them.
+Anything under `.gen` is disposable Vivado output. Expect regeneration to replace it.
 
 Every time you regenerate IP output products:
 
@@ -1239,7 +1231,7 @@ Every time you regenerate IP output products:
 
 Do not trust an old tutorial saying "edit line 450". That line number belongs to somebody else's Vivado version, project path, and generated output.
 
-Normal after regenerate:
+After regeneration, verify:
 
 ```text
 Your intended generated-file edit still exists.
@@ -1247,7 +1239,7 @@ IP output products are current.
 Git diff shows only expected changes.
 ```
 
-Bad after regenerate:
+Something got overwritten if:
 
 ```text
 Your edit disappeared.
@@ -1258,9 +1250,9 @@ Vivado upgraded IP unexpectedly.
 
 If you see the bad case, stop and fix it before building. A regenerated file silently undoing your work is one of the classic ways people waste days.
 
-### 6.7 PCIe Core Exit Check
+### 6.7 Check the Core Settings
 
-Move on when:
+Before touching shadow config:
 
 - IP GUI has correct IDs
 - BARs match donor type and size
@@ -1295,7 +1287,7 @@ Do not blindly use it to override:
 > [!NOTE]
 > **Under the Hood - why native Xilinx config space is detectable**
 >
-> The Xilinx 7 Series PCIe IP can enumerate cleanly, but its default config behavior still looks like a generic FPGA endpoint when writable bits, status/RW1C behavior, capability layout, BAR sizing responses, and enumeration side effects do not match the donor. Windows and PCIe tools do not only read VID/DID; they walk capability chains, write control bits, clear status bits, size BARs, and expect the whole config-space story to stay internally consistent.
+> The Xilinx 7 Series PCIe IP can enumerate cleanly and still look like a generic FPGA endpoint. Writable bits, RW1C status, capabilities, BAR sizing, and enumeration side effects all have to agree with the donor. Windows walks the chains, writes control bits, clears status, and sizes BARs; it does not stop at VID/DID.
 
 ### 7.2 Important Files
 
@@ -1334,9 +1326,9 @@ rw[203] <= 1'b0; // return BRAM data instead of zero data
 
 If config after the takeover point reads as all zero, check this first.
 
-### 7.4 Windows COE Workflow Overview
+### 7.4 Building the COE on Windows
 
-On Windows, your config COE can come from:
+Config COE input can come from:
 
 - Arbor exported text
 - TeleScan exported/saved data
@@ -1344,7 +1336,7 @@ On Windows, your config COE can come from:
 - HxD edited binary/hex data
 - a Python script that builds 1024 DWORDs
 
-Manual CSV is the lowest route. It is acceptable for a beginner test, but do not pretend it is professional capture.
+Manual CSV works for a first test. It is still the weakest capture route.
 
 Better priority order:
 
@@ -1375,7 +1367,7 @@ Your COE process must catch:
 - extended capability loops
 - copied Windows runtime BAR addresses
 
-Runtime BAR addresses are poison in static config data. If Device Manager says BAR0 is assigned at `D0000000-D0003FFF`, that is the OS allocation for that boot, not a value you should blindly paste into config-space COE.
+Never bake a runtime BAR address into static config data. A Device Manager range such as `D0000000-D0003FFF` is the OS allocation for that boot, not COE input.
 
 ### 7.5 Little-Endian Rule
 
@@ -1481,7 +1473,7 @@ Run in PowerShell:
 python C:\dma\tools\make_cfgspace_coe.py C:\dma\donor\rtl8125\config_dwords.csv C:\dma\donor\rtl8125\pcileech_cfgspace.coe
 ```
 
-Normal output:
+The generator should print:
 
 ```text
 0x000 VID/DID: 812510EC
@@ -1491,7 +1483,7 @@ Normal output:
 0x100 Extended Capability Header: 00030001
 ```
 
-Bad output:
+Zeroed identity fields mean stop:
 
 ```text
 0x000 VID/DID: 00000000
@@ -1590,7 +1582,7 @@ Run:
 python C:\dma\tools\check_cfgspace_coe.py C:\dma\donor\rtl8125\pcileech_cfgspace.coe
 ```
 
-Normal:
+The checker should finish with:
 
 ```text
 Key offsets print expected values.
@@ -1599,7 +1591,7 @@ Extended capability chain prints cleanly or stops cleanly.
 COE sanity check completed.
 ```
 
-Bad:
+Fix the COE if you see:
 
 ```text
 Bad COE depth
@@ -1647,13 +1639,13 @@ Then in Vivado:
 4. Confirm no COE file error
 5. Rebuild
 
-Normal:
+BRAM regeneration succeeded:
 
 ```text
 BRAM output products regenerated successfully.
 ```
 
-Bad:
+The COE or path is broken if:
 
 ```text
 cannot open COE file
@@ -1663,9 +1655,9 @@ invalid memory_initialization_vector
 
 Fix the COE format.
 
-### 7.10 Shadow Config Exit Check
+### 7.10 Review the Shadow Image
 
-Shadow config is complete only when:
+The shadow image is ready for target testing when:
 
 - `pcileech_cfgspace.coe` is generated by offset
 - key offsets `0x00`, `0x08`, `0x2C`, `0x34`, `0x100` are checked
@@ -1678,7 +1670,7 @@ Shadow config is complete only when:
 - BRAM output products are regenerated
 - target readback in Arbor/TeleScan shows the expected bytes
 
-No readback = no success.
+No readback, no result.
 
 ---
 
@@ -1686,7 +1678,7 @@ No readback = no success.
 
 ### 8.1 Why WriteMask Exists
 
-Real PCIe config space is not "all read-only" and not "all writable".
+PCIe config space is neither all read-only nor all writable.
 
 Examples:
 
@@ -1703,7 +1695,7 @@ If your WriteMask is wrong, Windows may enumerate the device but the driver will
 
 ### 8.2 WriteMask Quality Levels
 
-Beginner masks are not final firmware. They are only a way to prove the write path is alive.
+A beginner mask only proves that the write path is alive.
 
 | Level | Name | Meaning | Verdict |
 |------|------|---------|---------|
@@ -1713,7 +1705,7 @@ Beginner masks are not final firmware. They are only a way to prove the write pa
 | 3 | Capability-aware mask | PM/MSI/MSI-X/PCIe/AER handled at donor capability offsets | Serious config-space behavior. |
 | 4 | Driver-binding mask | Mask behavior refined from Windows driver writes and target readback | Required for stubborn drivers. |
 
-Direct warning:
+One easy file-name trap:
 
 - Command is not simply "all 16 bits writable".
 - Status is not normal writable memory; many bits are RW1C.
@@ -1739,9 +1731,9 @@ Again: this is `pcileech_fifo.sv`, not `pcileech_pcie_cfg_a7.sv`.
 
 ### 8.4 Simple Windows WriteMask COE Generator
 
-Beginner starting point. Not a PCIe spec model.
+This is a bring-up mask, not a PCIe register model.
 
-Level 1 only. It proves the path, not donor correctness.
+Treat it as Level 1: path proof, not donor correctness.
 
 Create:
 
@@ -1832,7 +1824,7 @@ Use the donor capability chain:
 0x34 -> first capability -> next -> next -> 0x00
 ```
 
-Then apply masks at the actual offsets. This is the difference between copying a guide and understanding the device.
+Apply masks at the offsets found in that chain, not at offsets copied from another card.
 
 ### 8.7 Replace WriteMask COE
 
@@ -1844,13 +1836,13 @@ ip/pcileech_cfgspace_writemask.coe
 
 Then regenerate the ROM/IP in Vivado.
 
-Normal:
+The WriteMask ROM rebuilt:
 
 ```text
 drom_pcie_cfgspace_writemask output products generated.
 ```
 
-Bad:
+Fix the source or COE if:
 
 ```text
 COE parse error
@@ -1879,7 +1871,7 @@ Test carefully:
 | Clear Status RW1C bits | Status behavior should be reasonable |
 | Enable MSI/MSI-X if exposed | Control bits should reflect Windows configuration |
 
-Bad results:
+WriteMask failures look like:
 
 ```text
 VID/DID changes after write
@@ -1891,9 +1883,9 @@ Device disappears after config write
 
 Those are WriteMask/shadow-write problems, not "just change VID/DID again" problems.
 
-### 8.9 WriteMask Exit Check
+### 8.9 Test the Mask
 
-Call WriteMask done when:
+The mask is ready when:
 
 - `rw[206]` in `pcileech_fifo.sv` is enabled
 - WriteMask COE exists
@@ -1911,11 +1903,7 @@ Call WriteMask done when:
 
 ### 9.1 BAR Is Not Just a Size in Vivado
 
-Vivado BAR config tells Windows what resources the device requests.
-
-BAR implementation tells Windows what happens when software reads or writes those resources.
-
-Those are different things.
+Vivado BAR settings declare the requested resources; the BAR responder handles the reads and writes. They are separate jobs.
 
 If Windows can assign a BAR but your FPGA returns nothing, the driver can still fail.
 
@@ -1966,7 +1954,7 @@ BAR validation has levels:
 | 4 | Writes and readback work | Some register storage behavior works. Not full device behavior. |
 | 5 | Stateful registers behave | Reset/status/interrupt-like behavior is modeled for tested paths. |
 
-Resources tab having a BAR is not BAR emulation. It only means Windows assigned an address range.
+A BAR in the Resources tab only proves allocation. It says nothing about the responder.
 
 Minimum BAR tests:
 
@@ -1978,7 +1966,7 @@ Minimum BAR tests:
 | Read high offset for larger BAR | Must work if BAR size is larger than 4KB |
 | Write expected control register | Expected state change or safe handling |
 
-Bad BAR output:
+BAR path failures look like:
 
 ```text
 read timeout
@@ -1989,17 +1977,17 @@ target freezes
 driver fails immediately after BAR read
 ```
 
-That means the BAR response path is probably wrong.
+Start with the BAR response path.
 
 ### 9.5 Dynamic BAR Response State Machine
 
 Static `case` tables are fine for a first readback test. They are not serious BAR emulation.
 
-A real Windows driver does not only read fixed IDs from BAR space. It writes control bits, rings doorbells, polls status, posts descriptors, masks interrupts, resets engines, and expects state to move forward. If your BAR module returns the same hardcoded DWORD forever, it is Level 2 at best.
+A Windows driver writes control bits, rings doorbells, polls status, posts descriptors, masks interrupts, and resets engines. It expects state to move. A BAR module that returns the same hardcoded DWORD forever is Level 2 at best.
 
 #### 9.5.1 Stop Confusing BAR Mailboxes with PCIe VDM
 
-Precise language matters:
+Keep the terminology straight:
 
 | Term | What it really means |
 |------|----------------------|
@@ -2008,7 +1996,7 @@ Precise language matters:
 | Doorbell | A BAR write that tells the device to consume descriptors, process a command, or update state. |
 | Completion | PCIe response to a read request. A BAR read must complete even when the register is unsupported. |
 
-If you need actual PCIe VDM TLP support, you must decode Message TLPs in the TLP RX path. Do not pretend a BAR write is a PCIe VDM. For this guide, the practical target is the BAR mailbox because that is what most donor drivers hit first.
+Actual PCIe VDM support belongs in the TLP RX Message decode. A BAR write is not a PCIe VDM. The example below uses a BAR mailbox because that is what most donor drivers hit first.
 
 Keep the layers separated:
 
@@ -2029,11 +2017,11 @@ Interrupt/control context:
   - cfg_interrupt path
 ```
 
-Shadow config space should not become your BAR state machine. Keep them independent. Config proves who you are. BAR behavior proves what you do.
+Keep shadow config and BAR state separate. Config carries identity; the BAR model carries runtime behavior.
 
 #### 9.5.2 Register Map for a Dynamic BAR Mailbox
 
-This example models a small vendor-defined BAR protocol. Replace the register meanings with your donor's actual BAR dump and driver trace.
+The example below is a small vendor-defined BAR protocol. Replace its register map with the donor BAR dump and driver trace.
 
 | Offset | Name | Access | Behavior |
 |--------|------|--------|----------|
@@ -2054,7 +2042,7 @@ This example models a small vendor-defined BAR protocol. Replace the register me
 | `0x038` | `IRQ_MASK` | RW | Interrupt mask |
 | `0x03C` | `ERROR_STATUS` | RW1C-ish | Sticky error bits |
 
-No magic here. Basic device behavior: writes change state, reads reflect that state, status moves, unsupported offsets complete safely.
+Writes must change state, reads must expose it, status must advance, and unsupported offsets must complete safely.
 
 #### 9.5.3 Drop-In SystemVerilog BAR State Machine
 
@@ -2377,11 +2365,11 @@ module pcileech_bar_impl_dynamic_mailbox(
 endmodule
 ```
 
-This still uses `case`, but only as an address decoder. The returned data is not static. It depends on host writes, timers, control bits, reset state, interrupt state, stream mode, and previous doorbells.
+`case` remains only as the address decoder. Returned data comes from host writes, timers, control/reset state, interrupt state, stream mode, and prior doorbells.
 
 #### 9.5.4 End-to-End MRd to CplD Closure
 
-Real driver handshakes take this path. If you cannot walk it, you are not debugging BAR behavior yet.
+Trace this path before debugging a driver handshake.
 
 ```text
 Windows kernel driver
@@ -2452,9 +2440,9 @@ Xilinx PCIe TX path
 Windows kernel driver receives the MMIO read result
 ```
 
-The key is tag closure. Drivers can issue multiple outstanding reads. The completion must carry the right tag and requester context back. That is why `rd_req_ctx` exists. Do not throw it away in a BAR responder.
+`rd_req_ctx` is not optional. With multiple reads outstanding, the completion needs the original tag and requester context.
 
-For `REG_DEVICE_SIGNATURE`, the state machine hit is boring and precise:
+For `REG_DEVICE_SIGNATURE`, the state-machine hit is:
 
 ```systemverilog
 localparam [11:0] REG_DEVICE_SIGNATURE = 12'h000;
@@ -2546,7 +2534,7 @@ pcileech_tlps128_sink_mux1 i_pcileech_tlps128_sink_mux1(
 );
 ```
 
-That is the closed loop:
+Packet path:
 
 ```text
 MRd tag enters on RX.
@@ -2558,7 +2546,7 @@ pcileech_pcie_tlp_a7.sv muxes it back to the PCIe TX path.
 driver receives the exact response for its original outstanding read.
 ```
 
-If the tag is wrong, the driver can receive a completion for a read it did not think was outstanding. If `rd_rsp_valid` never fires, the root complex waits until timeout. If the payload is static when the driver expects status movement, the handshake dies at the software layer.
+A wrong tag associates the completion with the wrong outstanding read. No `rd_rsp_valid` leaves the root complex waiting for timeout. Static payload where the driver expects status movement kills the handshake in software.
 
 #### 9.5.5 Dynamic BAR Validation
 
@@ -2577,7 +2565,7 @@ Test it like this:
 10. Write 0x034 IRQ_STATUS with the pending bits to clear them.
 ```
 
-Good behavior:
+The transaction path is healthy when:
 
 ```text
 STATUS busy bit toggles.
@@ -2588,7 +2576,7 @@ RW1C-style clear works for IRQ_STATUS and ERROR_STATUS.
 Unsupported writes do not crash the target.
 ```
 
-Bad behavior:
+Go back to the responder if:
 
 ```text
 STATUS never changes.
@@ -2599,11 +2587,11 @@ IRQ_STATUS cannot clear.
 BAR read freezes the machine.
 ```
 
-If your driver sends a BAR handshake and the FPGA returns a flat static table, the driver failure is earned. Build the state machine or document the missing behavior.
+If the driver sends a BAR handshake and gets a flat static table, implement the state machine or document the missing behavior.
 
-### 9.6 BAR Exit Check
+### 9.6 BAR Test Record
 
-Call BAR work done when:
+Record at least:
 
 - Windows resources show the expected BAR ranges
 - Arbor/TeleScan can read tested BAR offsets
@@ -2644,13 +2632,13 @@ Common IDs:
 | `0x11` | MSI-X |
 | `0x09` | Vendor Specific |
 
-Bad chain:
+A broken capability chain often looks like:
 
 ```text
 0x40 -> 0x60 -> 0x40
 ```
 
-That loops. Windows will not like it.
+That is a loop. Fix it before Windows walks the chain.
 
 ### 10.2 Extended Capability Chain
 
@@ -2719,9 +2707,9 @@ PMCSR can affect:
 
 Static config bytes with no writable PMCSR behavior can be enough to enumerate but fail driver start.
 
-### 10.6 Capability Exit Check
+### 10.6 Capability Sanity Check
 
-Capabilities are ready when:
+Before moving into driver behavior, check:
 
 - standard chain walks cleanly in Arbor/TeleScan
 - extended chain walks cleanly if present
@@ -2735,11 +2723,9 @@ Capabilities are ready when:
 
 ## 11. TLP Response Implementation
 
-### 11.1 The Problem
+### 11.1 Enumeration Is Only the Start
 
-Config space gets you enumerated.
-
-BAR/TLP behavior gets you past real software.
+Config space gets the endpoint enumerated. BAR and TLP behavior determine what happens when real software touches it.
 
 Drivers read BAR registers to decide whether the device is real. If your BAR logic returns invalid data, zeros, all F, or no completion, you will see Code 10, driver start failure, or crashes.
 
@@ -2766,7 +2752,7 @@ drd_req_addr
 
 If those signals do not exist in your file, the snippet is not compile-ready.
 
-Good tutorial code must include:
+A compile-ready example needs:
 
 - full module context
 - correct ports
@@ -2790,7 +2776,7 @@ Real drivers may expect:
 
 If your donor driver reads these and gets nonsense, Code 10 is normal.
 
-### 11.5 Windows Driver Binding Debug Rule
+### 11.5 When the Driver Does Not Bind
 
 If driver binding fails, stop changing VID/DID.
 
@@ -2806,13 +2792,13 @@ Check:
 - Device Manager Events
 - Windows Event Viewer if needed
 
-VID/DID is not magic.
+Once identity is correct, VID/DID is no longer the variable.
 
 ### 11.6 Completion Latency Shaping
 
-Static BAR data is only half the job. Timing also matters.
+BAR data is only half the job. Timing matters too.
 
-Real devices do not answer every MMIO read with the same toy-looking pattern forever. Some reads come back fast. Some depend on internal state. Some registers settle after reset. If your responder always returns the same DWORD with no believable delay, you are not modeling a device; you are only proving that the completion path is not dead.
+Real devices do not answer every MMIO read with one permanent pattern. Reads may depend on state or settle after reset. A fixed DWORD with fixed timing proves the completion path is alive; it does not model the device.
 
 Use the real upstream-style files:
 
@@ -2908,7 +2894,7 @@ pcileech_bar_latency_pipe #(
 
 If you add this to one exposed BAR, normalize the other exposed responders or prove they never participate in the same path. The existing example cores are often two-clock responders; mixing active responders with different unknown latencies is a debugging trap.
 
-Use boring delay classes first:
+Start with fixed delay classes:
 
 | Register type | Practical lab delay model |
 |---------------|---------------------------|
@@ -2992,9 +2978,9 @@ Important limits:
 
 ### 11.8 TLP Lifecycle and PMCSR State Alignment
 
-Static IDs are the cheap part. The hard part is making the endpoint behave consistently when the host sends real PCIe transactions.
+Static IDs are the easy part. The endpoint still has to behave consistently under real PCIe transactions.
 
-Scope: controlled lab validation and driver interoperability. Not protected-environment bypass. If your firmware claims to be a donor, its transaction lifecycle cannot contradict its config space, BAR behavior, power state, or interrupt plan.
+The transaction lifecycle cannot contradict the config space, BAR behavior, power state, or interrupt plan.
 
 #### 11.8.1 TLP Lifecycle Inside the FPGA
 
@@ -3072,7 +3058,7 @@ The firmware must keep these answers coherent:
 > [!NOTE]
 > **Under the Hood - dynamic behavior beats static cloning**
 >
-> A raw config clone can still fail if the transaction story contradicts itself. If PMCSR says D3hot but BAR registers still behave like D0, or MSI-X is enabled but the table/PBA BAR is dead, the firmware is not donor-like. It is just a config-space screenshot with a bitstream.
+> Raw config bytes are not enough when runtime behavior contradicts them. PMCSR in D3hot with D0-style BAR activity is wrong. So is enabled MSI-X with a dead table/PBA BAR. That is a config-space snapshot, not donor behavior.
 
 #### 11.8.2 PMCSR Bits That Matter
 
@@ -3213,11 +3199,11 @@ always @ (posedge clk) begin
 end
 ```
 
-That example is intentionally boring. Boring is good. First make the state transition deterministic. Then replace the DWORDs with donor-specific register behavior from your BAR dump and driver trace.
+Keep the first version deterministic. Once the state transition works, replace the example DWORDs with behavior taken from the BAR dump and driver trace.
 
-#### 11.8.4 PMCSR Validation Standard
+#### 11.8.4 PMCSR Bring-Up Checklist
 
-PMCSR behavior is not complete until you can show:
+For PMCSR, collect proof for each item below:
 
 - PM capability base is parsed from the donor, not guessed;
 - PMCSR offset is documented;
@@ -3228,11 +3214,11 @@ PMCSR behavior is not complete until you can show:
 - Windows readback confirms the PMCSR transition;
 - cold boot still enumerates cleanly.
 
-If the firmware ignores PMCSR completely, write that down. Hidden missing behavior is worse than an honest limitation.
+If PMCSR is still ignored, record it as unimplemented.
 
-### 11.9 TLP Response Exit Check
+### 11.9 Hold Off on More Logic
 
-Move on when:
+Do not stack more state machines on top until the current path meets all of these:
 
 - BAR controller builds cleanly
 - timing still passes
@@ -3265,7 +3251,7 @@ The first 4KB of one static BAR response can be read.
 > [!NOTE]
 > **Under the Hood - what Zero4K actually does**
 >
-> Zero4K is a static 4KB MMIO responder: host software writes selected BAR offsets, reads them back, and sees stable data instead of a timeout, all-zero noise, or all-`FF`s. That can satisfy basic BAR write/readback probes, but it does not prove reset logic, MSI-X table/PBA behavior, EEPROM/NVM windows, or real driver state machines.
+> Zero4K is a static 4KB MMIO responder. It gives basic BAR probes stable readback instead of timeout, zeroes, or all-`FF`. It says nothing about reset logic, MSI-X table/PBA, EEPROM/NVM windows, or driver state machines.
 
 Zero4K does **not** prove:
 
@@ -3372,7 +3358,7 @@ Then:
 
 ### 12.4 Zero4K Failure Signs
 
-Bad signs:
+Zero4K has reached its limit if:
 
 ```text
 BAR is 16KB but only first 4KB works
@@ -3388,9 +3374,9 @@ reset/status register needs stateful behavior
 
 Do not blame Vivado if your BAR model is incomplete.
 
-### 12.5 Zero4K Exit Check
+### 12.5 When Zero4K Is Enough
 
-Zero4K is acceptable when:
+Zero4K is a finished answer only when:
 
 - COE generated with 1024 DWORDs
 - byte order checked
@@ -3440,7 +3426,7 @@ In Vivado:
 7. Open utilization report
 8. Save logs and reports
 
-Normal:
+A build worth flashing ends with:
 
 ```text
 Synthesis completed successfully
@@ -3449,7 +3435,7 @@ write_bitstream completed successfully
 Timing constraints are met
 ```
 
-Bad:
+Stop before flashing on:
 
 ```text
 Synthesis failed
@@ -3497,7 +3483,7 @@ Output paths vary, but commonly:
 
 Do not make a mystery firmware. Save evidence.
 
-Minimum evidence is not optional. Full evidence is what you save when you want other people, or future you, to reproduce the work.
+The minimum set proves what was flashed. The full set lets someone reproduce it later.
 
 **Minimum Evidence**
 
@@ -3582,7 +3568,7 @@ Before any board-specific flashing:
 [ ] You saved the build hash
 ```
 
-If the programmer is not detected before flashing, your recovery path is fake.
+If the programmer is not detected before flashing, there is no tested recovery path.
 
 **Squirrel / LeetDMA**
 
@@ -3651,7 +3637,7 @@ Warnings:
 
 ### 13.6 SRAM Load vs Flash Programming
 
-Easy place to fool yourself.
+SRAM and flash are easy to confuse.
 
 | Operation | What happens |
 |----------|--------------|
@@ -3693,9 +3679,9 @@ After flashing:
 
 Warm reboot normal does not prove flash persistence.
 
-### 13.8 Build/Flash Exit Check
+### 13.8 Save the Build Before Leaving the Bench
 
-Build/flash is done when:
+Do not pack up after seeing the progress bar hit 100%. Save and verify:
 
 - bit/bin generated
 - timing reviewed
@@ -3727,7 +3713,7 @@ Check:
 - Resources tab
 - Events tab
 
-Normal:
+A clean Device Manager result:
 
 ```text
 Device status: This device is working properly.
@@ -3736,7 +3722,7 @@ Resources show expected memory ranges.
 No conflict listed.
 ```
 
-Bad:
+Enumeration or driver work remains if:
 
 ```text
 Unknown device
@@ -3776,7 +3762,7 @@ Then classify differences:
 
 Your diff table should not say "close enough". It should say stable, runtime, intentional, or bug.
 
-Bad readback:
+Readback problems:
 
 ```text
 0x40 and later all zero
@@ -3802,7 +3788,7 @@ Test:
 6. Clear reasonable Status/RW1C bits
 7. Confirm device remains alive
 
-Normal:
+The config write path is behaving when:
 
 ```text
 Command writable bits stick.
@@ -3811,7 +3797,7 @@ Status behavior is reasonable.
 Device remains present.
 ```
 
-Bad:
+WriteMask or shadow bugs look like:
 
 ```text
 Command never changes
@@ -3820,7 +3806,7 @@ device disappears after config write
 MSI enable cannot stick
 ```
 
-That is WriteMask/shadow write behavior.
+Those are WriteMask/shadow-write failures.
 
 ### 14.4 Windows BAR Readback Test
 
@@ -3834,7 +3820,7 @@ Minimum:
 - high offset if BAR is larger than 4KB
 - MSI-X table/PBA offset if MSI-X exists
 
-Normal:
+A working BAR path:
 
 ```text
 BAR read completes.
@@ -3843,7 +3829,7 @@ Unsupported offsets return safe values.
 Target does not freeze.
 ```
 
-Bad:
+A broken or incomplete BAR path:
 
 ```text
 read timeout
@@ -3947,13 +3933,11 @@ Likely causes:
 | CH347/OpenOCD/Vivado HW Manager does not see board | programmer driver, wrong cable, board mode, power | Windows Device Manager programmer entry |
 | Board dead after flash | wrong board folder, wrong FPGA package, bad image | recovery image/tool |
 
-### 14.7 Industrial Targeted Diagnostic Matrix
+### 14.7 Failure Matrix
 
-Do not debug hardware failures by mood.
+Match the symptom, collect the listed evidence, and fix the first failing layer.
 
-Use a matrix. Put the symptom in one row, collect the evidence, and attack the first failing layer. PCIe bugs look mystical only when you skip layers.
-
-Five-level validation stack:
+Work from the lowest failing layer:
 
 | Level | Layer | What must be proven | Primary evidence |
 |------|-------|---------------------|------------------|
@@ -3965,7 +3949,7 @@ Five-level validation stack:
 
 #### 14.7.1 POST Hang / BIOS Freeze / No Boot
 
-| Symptom | Deep root cause | Hard evidence to collect | Targeted fix | Do not do this |
+| Symptom | Likely cause | Evidence | Fix | Avoid |
 |---------|-----------------|--------------------------|--------------|----------------|
 | Motherboard freezes before OS boot | BAR request is too large for firmware MMIO allocation window | BIOS POST code, resources differ between stock and custom firmware, BAR size in PCIe IP | Reduce BAR size to donor-realistic value; disable unused BARs; confirm 64-bit pairing | Do not increase BAR size because "bigger looks real" |
 | POST hangs only with custom bitstream | PCIe link training timeout or unstable LTSSM transition | ILA `pl_ltssm_state`, `pl_phy_lnk_up`, `pl_initial_link_width`, cold boot capture | Fix PCIe IP speed/lane settings; test Gen1 first; verify slot/adaptor signal integrity | Do not edit VID/DID for a link training failure |
@@ -3987,7 +3971,7 @@ No correct FPGA package = do not debug BAR behavior.
 
 Code 10 and Code 43 are not solved by changing IDs. They mean the driver or Windows device stack hit behavior that did not match the device contract.
 
-| Symptom | Deep root cause | Evidence to collect | Targeted test | Targeted fix |
+| Symptom | Likely cause | Evidence | Test | Fix |
 |---------|-----------------|---------------------|---------------|--------------|
 | Code 10 immediately after driver start | BAR read returns timeout/all-zero/all-`FF` | Arbor/TeleScan BAR read, Events tab, ILA BAR `rd_req_valid` vs `rd_rsp_valid` | Read first DWORD, first 4KB, unsupported offset | Implement BAR responder for the register path the driver touches |
 | Code 10 after config writes | WriteMask blocks required writable bits | Arbor/TeleScan before/after `CfgWr0`, ILA `pcie_rx_wren`, target config diff | Toggle Command, MSI Enable, PMCSR PowerState at donor offsets | Regenerate capability-aware WriteMask |
@@ -4022,7 +4006,7 @@ The fix for Code 10/43 is usually one layer deeper than Device Manager says.
 
 A BSOD during driver load is a hard failure. Treat it as a protocol crash until proven otherwise.
 
-| Crash timing | Deep root cause | Evidence to collect | ILA / software probe | Targeted fix |
+| Crash timing | Likely cause | Evidence | ILA / software probe | Fix |
 |-------------|-----------------|---------------------|----------------------|--------------|
 | BSOD immediately after driver starts | Driver MMIO read gets no completion or illegal response | Windows crash time, BAR readback, ILA `rd_req_valid` without `rd_rsp_valid` | Trigger on first MemRd to BAR after driver bind | Return safe completion for every decoded and unsupported offset |
 | BSOD after a BAR write handshake | FPGA ignores doorbell/mailbox write | ILA `wr_valid`, `wr_addr`, `wr_data`, following status polls | Trigger on write to doorbell/status/control offset | Add dynamic BAR state machine; update busy/status/response |
@@ -4061,9 +4045,9 @@ Do not keep rebooting into BSOD and changing random IDs. Capture the failing tra
 | Timing report | Build timing health | Functional correctness |
 | Cold boot | Flash persistence and link training | Full driver behavior |
 
-The line is simple: every serious failure maps to a layer, an artifact, and a first fix. If your notes only say "yellow triangle", you are not debugging yet.
+A "yellow triangle" is not a diagnosis. Tie the failure to a layer, capture the artifact, then fix the first broken part.
 
-### 14.8 Normal vs Bad Output Examples
+### 14.8 Reading the Output
 
 **Vivado normal**
 
@@ -4244,9 +4228,9 @@ BAR/resources differ from warm reboot
 
 If you cannot show the evidence, you did not finish the step.
 
-### 14.10 Windows Validation Exit Check
+### 14.10 Keep a Test Record
 
-Windows validation is complete only when:
+Save the following with the build:
 
 - Device Manager status is saved
 - Hardware IDs are saved
@@ -4259,9 +4243,9 @@ Windows validation is complete only when:
 - driver binding result is recorded
 - cold boot result is recorded
 
-### 14.11 Release Gate
+### 14.11 Before Calling It Final
 
-Do not publish a "final" firmware/tutorial update unless:
+Only call the build final after:
 
 - Windows donor capture reaches at least Level 3
 - COE generation is reproducible
@@ -4274,7 +4258,7 @@ Do not publish a "final" firmware/tutorial update unless:
 - all known differences are classified as stable, runtime, intentional, or bug
 - the README does not imply that VID/DID-only work is complete firmware
 
-If you want this guide to be better than the usual low-quality public tutorials, this is the line. Below this line is still practice, not release.
+Anything short of this stays experimental.
 
 ---
 
@@ -4392,7 +4376,7 @@ Do this in order. Do not change five things at once.
 7. Fix the first broken branch only.
 8. Rebuild and repeat.
 
-Normal early enumeration should look boring:
+A routine early-enumeration trace is boring:
 
 ```text
 CfgRd0 arrives
@@ -4403,7 +4387,7 @@ capability chain reads continue
 BAR MMIO reads complete if the driver starts
 ```
 
-Bad early enumeration looks like this:
+The first break often looks like:
 
 ```text
 CfgRd0 arrives once, then nothing
@@ -4415,9 +4399,9 @@ BAR read request appears but rd_rsp_valid never fires
 
 If ILA says the host never sent the packet, the bug is not in your BAR responder. If ILA says the packet arrived and you never replied, the bug is yours.
 
-### ILA.4 ILA Exit Check
+### ILA.4 What to Save
 
-Move on when:
+An ILA session is useful only if you leave with:
 
 - ILA probes are attached to the actual RX/TLP path
 - trigger catches `CfgRd0` and `CfgWr0`
@@ -4431,18 +4415,18 @@ Move on when:
 
 ## Automation Tools & Scripts
 
-Automation is useful only when it preserves offsets. A script that shifts one DWORD creates professional-looking broken firmware.
+Automation must preserve offsets. A one-DWORD shift can pass a quick visual check while breaking every offset after it.
 
 ### AUTO.1 Convert Raw Config Hex to SystemVerilog Array
 
-Accepts common `lspci -xxxx`/TeleScan-style hex lines. Plain `lspci -vvv` is useful for capability text, but usually lacks the raw byte image this parser needs. If the capture has no offset-prefixed hex lines, use `lspci -xxxxxxx` from Appendix A or export raw config bytes from TeleScan.
+The parser accepts common `lspci -xxxx` and TeleScan-style hex lines. Plain `lspci -vvv` usually has capability text but not the raw byte image. If there are no offset-prefixed hex lines, use `lspci -xxxxxxx` from Appendix A or export raw config bytes from TeleScan.
 
 ```text
 00: ec 10 25 81 07 04 10 00 05 00 00 02 10 00 00 00
 10: 04 00 00 f0 00 00 00 00 04 00 00 f2 00 00 00 00
 ```
 
-It emits a little-endian DWORD array suitable for SystemVerilog test logic or manual comparison.
+Output is a little-endian DWORD array for SystemVerilog test logic or manual comparison.
 
 Create:
 
@@ -4510,7 +4494,7 @@ Run:
 python C:\dma\tools\config_hex_to_sv.py C:\dma\donor\rtl8125\config_hex.txt C:\dma\donor\rtl8125\cfg_space.sv
 ```
 
-Bad output:
+Reject output like:
 
 ```text
 0x000: 32'hFFFFFFFF
@@ -4518,7 +4502,7 @@ Bad output:
 0x034: points outside captured range
 ```
 
-Good output:
+Usable output starts like:
 
 ```text
 0x000: vendor/device DWORD matches donor
@@ -4532,7 +4516,7 @@ Do not paste this array blindly into a COE file. COE generation has its own form
 
 ### AUTO.2 Minimal Vivado Batch Build Script
 
-For repeat builds, keep a tiny Tcl wrapper and save logs. The exact project scripts differ by board folder, but the flow should be boring:
+For repeat builds, keep a small Tcl wrapper and save logs. Project scripts differ by board folder; the build sequence does not:
 
 Create:
 
@@ -4597,13 +4581,13 @@ flash tool screenshot
 cold boot result
 ```
 
-If you cannot reproduce the bitstream from a saved folder and saved logs, you do not have an engineering workflow. You have a lucky build.
+If the saved folder and logs cannot reproduce the bitstream, the build is not reproducible.
 
 ---
 
 ## Appendix A: Advanced Linux Raw Capture
 
-Advanced evidence path. It does not replace the Windows-first workflow, and beginners do not need it for a first Windows build. Raw bytes beat screenshots when you can capture them cleanly.
+This appendix is the stronger evidence path. It stays optional for the first Windows build; use it when clean raw capture is available.
 
 Use this appendix when:
 
@@ -4612,7 +4596,7 @@ Use this appendix when:
 - you want Linux-side `setpci` write tests;
 - you want a stronger donor-target diff than GUI screenshots alone.
 
-Do not use this appendix to pretend Linux is mandatory. It is not. Windows-first remains the main route.
+Linux stays optional. Nothing in this appendix replaces the Windows-first route.
 
 ### A.1 Identify the Donor BDF
 
@@ -4663,7 +4647,7 @@ cp "/sys/bus/pci/devices/$BDF/config" donor-capture/config-4096.bin
 hexdump -C donor-capture/config-4096.bin | head -40
 ```
 
-Expected:
+Check the file size:
 
 ```text
 00000000  ec 10 25 81 ...
@@ -4696,7 +4680,7 @@ Use it to map:
 - resource flags;
 - which `resourceN` file maps to which BAR.
 
-Again: runtime BAR address is not a firmware constant. Do not paste it into config-space COE.
+The runtime BAR address is not a firmware constant. Keep it out of config-space COE.
 
 ### A.5 BAR Binary Dump
 
@@ -4732,20 +4716,20 @@ Some capture workflows bind the donor to `vfio-pci` to prevent the normal driver
 
 That usually requires IOMMU enabled on the donor capture machine.
 
-No conflict with DMA target testing where IOMMU may be disabled. Different machine, different purpose.
+That does not conflict with a separate target configured differently for DMA testing.
 
 ### A.7 Offline 4096-Byte Physical Config Dump
 
-Windows-first is still the main route. But when Windows HVCI/VBS, kernel isolation, or driver policy blocks Arbor/TeleScan from reading beyond `0x100`, stop guessing. Move the donor to a Linux lab box and take the raw bytes.
+Use this fallback when HVCI/VBS, kernel isolation, or driver policy blocks Arbor/TeleScan beyond `0x100`: move the donor to a Linux lab box and capture the raw bytes.
 
-Not pretty output. A 4096-byte physical config-space artifact that survives review, hashing, and script conversion.
+Capture a 4096-byte config-space artifact that can be reviewed, hashed, and converted by script.
 
 > [!NOTE]
 > **Pro-Tip - Secure Boot and kernel lockdown**
 >
 > Some Linux distributions restrict raw PCI config or MMIO access when Secure Boot enables kernel lockdown. If `/sys/bus/pci/devices/$BDF/config` refuses full reads, disable Secure Boot for the capture machine, reboot, and try again. Document the state. Do not silently downgrade a failed 4KB capture into a screenshot.
 
-Hard workflow:
+Capture workflow:
 
 ```bash
 #!/usr/bin/env bash
@@ -4805,13 +4789,13 @@ chmod +x capture-donor-raw.sh
 sudo ./capture-donor-raw.sh 0000:01:00.0 donor-rtl8125-raw
 ```
 
-The direct command behind the workflow is:
+The same capture as a single command:
 
 ```bash
 sudo dd if=/sys/bus/pci/devices/0000:01:00.0/config of=donor_extended_cfg.bin bs=1 count=4096 status=progress
 ```
 
-Normal output:
+A complete dump run ends with:
 
 ```text
 4096 bytes copied
@@ -4821,7 +4805,7 @@ SHA256SUMS generated
 0x100 contains extended capability header or documented zero
 ```
 
-Bad output:
+The capture is incomplete if:
 
 ```text
 Permission denied
@@ -4834,11 +4818,11 @@ Fix the capture machine. Do not patch around a bad donor dump.
 
 ### A.8 Convert Raw Binary Dump to PCILeech COE and WriteMask
 
-The script reads `donor_extended_cfg.bin`, sanitizes fields that should not be blindly cloned, emits `pcileech_cfgspace.coe`, emits `pcileech_cfgspace_writemask.coe`, emits `vivado_pci_core_config.tcl`, and writes a small markdown report.
+The script reads `donor_extended_cfg.bin`, sanitizes fields that should not be cloned, and writes both COE files, `vivado_pci_core_config.tcl`, and a short report.
 
-The COE and WriteMask generation logic stays the same. The upgrade is the Vivado Tcl output: the script extracts donor identity fields from raw config bytes and BAR0 size/type from Linux `resource.txt`, then generates a Tcl file that aligns the Xilinx PCIe hard IP without GUI hand typing.
+COE and WriteMask generation stay unchanged. The script also builds Vivado Tcl from the identity bytes and BAR0 size/type in Linux `resource.txt`. Source that file instead of retyping the hard-IP settings in the GUI.
 
-It is built to fit this guide's existing file map:
+Install the outputs here:
 
 | Output | Install location |
 |--------|------------------|
@@ -5325,20 +5309,20 @@ generated/vivado_pci_core_config.tcl        -> source in Vivado Tcl Console
 generated/donor_raw_report.md              -> donor evidence folder
 ```
 
-Do not use your eyes and hands to type IDs and BAR sizes into Vivado GUI if this Tcl exists. Source the generated file in Vivado Tcl Console:
+Source the generated Tcl instead of retyping IDs and BAR sizes in the Vivado GUI:
 
 ```tcl
 source C:/dma/donor/rtl8125/generated/vivado_pci_core_config.tcl
 ```
 
-Let code align code.
+This keeps the hard-IP settings tied to the same donor capture as the COE files.
 
 Example generated Tcl:
 
 ```tcl
 # Auto-generated from donor physical PCIe config capture.
 # Do not hand-type these values in Vivado GUI.
-# Let code align code.
+# Keep the capture data and PCIe IP settings in sync.
 
 set pcie_ip [get_ips pcie_7x_0]
 if { [llength $pcie_ip] != 1 } {
@@ -5371,7 +5355,7 @@ Rebuild.
 Then verify target readback.
 ```
 
-Normal script output:
+A clean conversion prints:
 
 ```text
 Generated: donor-rtl8125-raw/generated/pcileech_cfgspace.coe
@@ -5386,7 +5370,7 @@ Standard capabilities: 5
 Extended capabilities: 3
 ```
 
-Bad script output:
+Stop and inspect the capture on:
 
 ```text
 Expected 4096 bytes, got 256 bytes
@@ -5422,9 +5406,9 @@ Before Vivado:
 
 Raw bytes are better than screenshots. Raw bytes converted blindly are still a fast way to build broken firmware.
 
-### A.10 Linux Raw Capture Exit Check
+### A.10 What a Complete Raw Capture Contains
 
-Linux raw capture is done when:
+For a complete raw capture, save:
 
 - `lspci -nn` saved;
 - `lspci -vvv` saved;
@@ -5442,7 +5426,7 @@ Linux raw capture is done when:
 
 ## Appendix B: Advanced Validation Commands
 
-These commands are advanced validation tools. They supplement Windows readback; they do not replace the Windows-first path.
+Appendix B supplements the Windows readback path.
 
 ### B.1 Linux Config Readback
 
@@ -5504,7 +5488,7 @@ sudo setpci -s "$BDF" 00.L=ffffffff
 sudo setpci -s "$BDF" 00.L
 ```
 
-Expected:
+What should happen:
 
 - VID/DID should not become `ffff:ffff`;
 - allowed Command bits should change;
@@ -5674,7 +5658,5 @@ Critical reminders:
 ---
 
 **License**: Content released under MIT License.
-
-*This guide is for controlled lab use, hardware learning, interoperability testing, and security research.*
 
 *Last Updated: June 2026*
