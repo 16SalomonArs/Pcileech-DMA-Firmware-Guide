@@ -1,42 +1,4 @@
-# DMA Firmware Customization Guide
-
-## 2026.6.18 Revised Edition
-
-I despise scammers who sell **low-quality firmware** at absurd prices.
-
-I also hate tutorials that deliberately skip the important parts, throw five screenshots at beginners, and then act like "change VID/DID" is firmware creation.
-
-I wrote this for people starting from zero who still want to build **custom PCILeech DMA firmware** properly. The missing details are why so many copied builds never get past Device Manager.
-
-> **Windows is the main route here.** Linux is useful for deeper capture and validation, but the build does not depend on `lspci`, `setpci`, sysfs, or Linux BAR dumps.
-
-> This guide is intended for controlled lab use, hardware learning, interoperability testing, and security research. It is not a guide for bypassing access controls, anti-cheat systems, or protected environments.
-
-> If the basics are already familiar, study **[VoltCyclone/PCILeechFWGenerator](https://github.com/VoltCyclone/PCILeechFWGenerator)** too. Automation helps, but the first failure will still force you to understand every setting it touches.
-
----
-
-## Table of Contents
-
-1. [Environment and tools](#1-environment-and-tools)
-2. [Board and recovery preparation](#2-board-and-recovery-preparation)
-3. [Donor information capture](#3-donor-information-capture)
-4. [PCIe Core parameters](#4-pcie-core-parameters)
-5. [Configuration space](#5-configuration-space)
-6. [Shadow Config](#6-shadow-config)
-7. [WriteMask](#7-writemask)
-8. [Capability layout](#8-capability-layout)
-9. [BAR implementation](#9-bar-implementation)
-10. [Project generation and build](#10-project-generation-and-build)
-11. [Timing review](#11-timing-review)
-12. [BIT and BIN output](#12-bit-and-bin-output)
-13. [Flashing](#13-flashing)
-14. [Configuration-space and BAR checks](#14-configuration-space-and-bar-checks)
-15. [Common problems](#15-common-problems)
-16. [Linux supplement](#16-linux-supplement)
-17. [File and term reference](#17-file-and-term-reference)
-
----
+# PCILeech FPGA Firmware Customization Guide
 
 ## 1. Environment and tools
 
@@ -64,8 +26,6 @@ Keep paths short. `C:\pcileech-fpga` avoids quoting problems in exported Vivado 
 
 The board directory fixes the FPGA part, package, XDC, top module, project name, and output name. Do not move constraints or generated IP between profiles.
 
-Use the [board profile and build-output table](firmware-notes/board-notes.md) when selecting the source directory, FPGA part, generator, and output filename.
-
 | Board profile | Upstream directory | FPGA part | Project generator | Build script |
 |---|---|---|---|---|
 | CaptainDMA 35T FGG484 | `CaptainDMA/35t484_x1` | `xc7a35tfgg484-2` | `vivado_generate_project_captaindma_35t.tcl` | `vivado_build.tcl` |
@@ -85,8 +45,6 @@ Record the donor before editing the PCIe IP. At minimum, save:
 - MSI layout, DSN, and the PM capability offset;
 - driver name and version;
 - config-space and BAR readback from the same device state.
-
-Fill in the [donor and build record templates](firmware-notes/templates.md) before changing the PCIe IP or shadow image.
 
 Device Manager supplies the instance ID, hardware IDs, driver details, and allocated resources. PowerShell can preserve the property set:
 
@@ -122,7 +80,7 @@ Keep the XCI BAR declaration aligned with the RTL instance selected in `src/pcil
 
 The shadow image is `ip/pcileech_cfgspace.coe`. The attached BRAM is 32 bits wide and 1024 DWORDs deep, so the image covers 4096 bytes.
 
-Build the image from offset-tagged DWORDs rather than pasted rows. Check the input with the [configuration-space structure fixture](coe-tools/examples/config_structure_test.csv), generate the COE with [`make_cfgspace_coe.py`](coe-tools/make_cfgspace_coe.py), and inspect it with [`check_cfgspace_coe.py`](coe-tools/check_cfgspace_coe.py). The complete command and CSV reference is in [helper script inputs and commands](firmware-notes/scripts.md).
+Build the image from offset-tagged DWORDs rather than pasted rows. Use `coe-tools/examples/config_structure_test.csv` to check the input format; pass the donor CSV when generating a board image:
 
 ```powershell
 python .\coe-tools\make_cfgspace_coe.py .\coe-tools\examples\config_structure_test.csv .\coe-tools\examples\pcileech_cfgspace.coe
@@ -151,8 +109,6 @@ Review `0x00`, `0x04`, `0x08`, `0x2C`, `0x34`, and `0x100`, then walk both capab
 
 The shadow path is controlled in `src/pcileech_fifo.sv`:
 
-Check [RTL ownership and register paths](firmware-notes/implementation-notes.md) before changing `rw[]` indices or moving logic between modules.
-
 ```systemverilog
 rw[202] <= 1'b1; // configuration TLP processing
 rw[203] <= 1'b0; // return BRAM data instead of zero
@@ -175,7 +131,7 @@ The WriteMask image is `ip/pcileech_cfgspace_writemask.coe`. One mask bit of `1`
 assign wr_dina[i] = wr_mask[i] ? wr_data_d[i] : rd_data[i];
 ```
 
-Generate the mask with [`make_writemask_coe.py`](coe-tools/make_writemask_coe.py). Start from the [WriteMask structure fixture](coe-tools/examples/writemask_structure_test.csv), then replace its rows with the donor's actual writable fields:
+Generate the mask from an offset/mask CSV. `coe-tools/examples/writemask_structure_test.csv` is a structure test fixture; replace its rows with the donor's actual writable fields:
 
 ```powershell
 python .\coe-tools\make_writemask_coe.py .\coe-tools\examples\writemask_structure_test.csv .\coe-tools\examples\pcileech_cfgspace_writemask.coe
@@ -227,7 +183,7 @@ For a donor comparison, locate the PM capability through the standard chain and 
 
 The checked-in controller connects Zero4K to BAR0 and loopback to BAR1. The XCI enables only BAR0, so the active stock path is Zero4K. Its initial contents come from `ip/pcileech_bar_zero4k.coe` through `bram_bar_zero4k.xci`.
 
-Generate a 1024-DWORD BAR0 image with [`make_zero4k_coe.py`](coe-tools/make_zero4k_coe.py). The [BAR0 CSV fixture](coe-tools/examples/bar0_dwords.csv) shows the required offset/DWORD layout:
+Generate a 1024-DWORD BAR0 image with:
 
 ```powershell
 python .\coe-tools\make_zero4k_coe.py .\coe-tools\examples\bar0_dwords.csv .\coe-tools\examples\pcileech_bar_zero4k.coe
@@ -348,8 +304,6 @@ For a config write, trigger on `pcie_rx_wren` and compare `pcie_rx_be` with the 
 
 ## 15. Common problems
 
-Use the expanded [Windows troubleshooting table](firmware-notes/troubleshooting.md) when the symptom is not covered below.
-
 | Symptom | Check | Action |
 |---|---|---|
 | Vivado reports the wrong part | Project part and selected board directory | Regenerate from the matching CaptainDMA Tcl file |
@@ -370,7 +324,7 @@ Use the expanded [Windows troubleshooting table](firmware-notes/troubleshooting.
 
 ## 16. Linux supplement
 
-Linux is useful for an offset-preserving 4096-byte donor capture. The [Linux donor capture notes](firmware-notes/linux-capture.md) cover the saved files and size checks. Set the BDF and output directory, then run:
+Linux is useful for an offset-preserving 4096-byte donor capture. Set the BDF and output directory, then run:
 
 ```bash
 set -euo pipefail
@@ -399,8 +353,6 @@ sha256sum "$OUT"/* > "$OUT/SHA256SUMS"
 The binary must retain byte offsets. `resource.txt` supplies assigned resource ranges and aperture sizes; the config BAR DWORD by itself does not supply the aperture size.
 
 ## 17. File and term reference
-
-Use the [file and PCIe term reference](firmware-notes/reference.md) when matching an upstream module, generated image, or register term. After changing a helper or repository path, run the [COE tool regression tests](coe-tools/tests/test_coe_tools.py) and [documentation path tests](coe-tools/tests/test_docs.py).
 
 | Purpose | File or module |
 |---|---|
