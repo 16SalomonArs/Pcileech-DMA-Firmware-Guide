@@ -12,6 +12,7 @@ PM capability base / PMCSR:
 MSI or MSI-X fields:
 DSN:
 Driver and version:
+First driver-load BAR trace:
 Capture tool and saved files:
 ```
 
@@ -62,7 +63,7 @@ Capability / Command / PMCSR readback:
 Dynamic BAR byte-enable and side-effect checks:
 DMA read data comparison:
 DMA write data comparison:
-Split Completion / Tag / timeout checks:
+Split Completion / Tag / timeout quarantine checks:
 Queue wrap and descriptor completion:
 MSI acknowledgement:
 MSI-X table, mask, and PBA checks:
