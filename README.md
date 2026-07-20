@@ -4,9 +4,11 @@
 
 I despise scammers who sell **low-quality firmware** at absurd prices.
 
-I also hate tutorials that deliberately skip the important parts, throw five screenshots at beginners, and then act like "change VID/DID" is firmware creation.
+I wrote this for people starting from zero who still want to build **custom PCILeech DMA firmware** properly. 
 
-I wrote this for people starting from zero who still want to build **custom PCILeech DMA firmware** properly. The missing details are why so many copied builds never get past Device Manager.
+In the past, many tutorials deliberately skipped crucial steps, showed beginners five screenshots, and passed off “changing the VID/DID” as firmware development.
+
+There are far too many fake tutorials nowadays—lengthy, AI-generated walls of text that are impossible to follow in practice.
 
 > **Windows is the main route here.** Linux is useful for deeper capture and validation, but the build does not depend on `lspci`, `setpci`, sysfs, or Linux BAR dumps.
 
