@@ -13,6 +13,11 @@
 | Config TLP shadow | `CaptainDMA/<profile>/src/pcileech_tlps128_cfgspace_shadow.sv` |
 | TLP routing and response mux | `CaptainDMA/<profile>/src/pcileech_pcie_tlp_a7.sv` |
 | BAR TLP and implementations | `CaptainDMA/<profile>/src/pcileech_tlps128_bar_controller.sv` |
+| PCIe core wrapper, resets, PM, and link signals | `CaptainDMA/<profile>/src/pcileech_pcie_a7.sv` |
+| TLP and control interfaces | `CaptainDMA/<profile>/src/pcileech_header.svh` |
+| FT601 command and TLP routing | `CaptainDMA/<profile>/src/pcileech_fifo.sv` |
+| FT601/PCIe clock crossings | `CaptainDMA/<profile>/src/pcileech_com.sv`, `CaptainDMA/<profile>/src/pcileech_pcie_tlp_a7.sv` |
+| FT601 output-channel mux | `CaptainDMA/<profile>/src/pcileech_mux.sv` |
 | Board pins and clocks | `CaptainDMA/<profile>/src/*.xdc` |
 | Project generation | `CaptainDMA/<profile>/vivado_generate_project_captaindma_*.tcl` |
 | Synthesis and implementation | `CaptainDMA/<profile>/vivado_build.tcl` |
@@ -33,4 +38,7 @@
 | TLP | PCIe Transaction Layer Packet. |
 | Byte Enable | Four lane bits carried with a DWORD write; the BAR controller passes them to `wr_be`. |
 | Completion | The read response TLP assembled by the BAR read engine and returned through `tlps_bar_rsp`. |
+| Requester Tag | The 8-bit field used to match a Memory Read with Cpl/CplD packets. It is unrelated to the 2-bit output-channel tags in `pcileech_mux.sv`. |
+| Descriptor | A driver/device work record. The checked-in transport FIFOs do not define a descriptor format or queue ABI. |
+| FLR | Function Level Reset, reported by the core as `ctx.cfg_received_func_lvl_rst`. |
 | WriteMask | Per-bit selector that chooses incoming config-write data or the existing BRAM value. |

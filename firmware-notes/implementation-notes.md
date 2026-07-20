@@ -68,3 +68,48 @@ The read path is `pcileech_pcie_tlp_a7.sv` `tlps_rx`, `pcileech_tlps128_bar_cont
 The XCI enables MSI and disables MSI-X. `pcileech_pcie_cfg_a7.sv` maps the Xilinx core's interrupt and PM signals into its register banks, but the checked-in board RTL does not add a periodic interrupt generator or a custom PM state machine. Keep any new behavior in a separate module and update the board project sources before documenting it.
 
 For ILA work, use the existing signals rather than inventing a parallel monitor. Config writes use `pcie_rx_wren`, `pcie_rx_addr`, `pcie_rx_data`, `pcie_rx_be`, and `bram_wr_be`. BAR reads use `rd_req_valid`, `rd_req_bar`, `rd_req_addr`, `rd_rsp_valid`, and `rd_rsp_data`. Interrupt checks use `ctx.cfg_interrupt`, `ctx.cfg_interrupt_rdy`, `ctx.cfg_interrupt_msienable`, and `ctx.cfg_interrupt_msixenable`.
+
+## TLP transport and arbitration
+
+`src/pcileech_pcie_a7.sv` is the wrapper around the Xilinx PCIe core. Its 64-bit RX AXI stream is converted to `IfAXIS128 tlps_rx`; the 128-bit transmit stream is converted back to the core's 64-bit interface. Both sides run on `clk_pcie`, supplied by `user_clk_out`.
+
+`src/pcileech_pcie_tlp_a7.sv`, module `pcileech_pcie_tlp_a7`, fans `tlps_rx` into the BAR controller, shadow configuration handler, and packet filter. `pcileech_tlps128_dst_fifo` crosses accepted RX packets to `clk_sys` through `fifo_134_134_clk2`. In the other direction, `pcileech_tlps128_src_fifo` packs `dfifo.tx_data` in `clk_sys` and crosses complete 128-bit beats through `fifo_134_134_clk2_rxfifo`.
+
+`pcileech_tlps128_sink_mux1` is the only transmit arbiter. Its fixed order is configuration response, BAR response, FIFO-injected TLP, then static TLP. It holds the selected stream until a valid last beat. A DMA packet source belongs in this arbiter; it must not bypass it or delay configuration and BAR Completions behind an unbounded request stream.
+
+## What the BAR read engine does
+
+`pcileech_tlps128_bar_rdengine` accepts Memory Read requests addressed to an endpoint BAR. It preserves Requester ID and Tag, splits responses larger than 128 bytes or crossing its 128-byte segment, reads one DWORD at a time from the selected BAR implementation, and builds CplD packets. This is target-side MMIO service. It does not generate outbound host-memory reads.
+
+The write engine handles 3-DWORD and 4-DWORD Memory Write headers, carries first/last byte enables into `wr_be`, and advances `wr_addr` for each data DWORD. `pcileech_bar_impl_zerowrite4k` uses that byte enable directly on BRAM writes. A dynamic register bank should consume the same interface and keep its response context aligned to the existing two-clock read contract.
+
+## Device engine insertion points
+
+The following functions are absent from the pinned board RTL and need one device-level owner rather than additions to unrelated `rw[]` banks:
+
+| Function | Existing boundary | Integration point |
+|---|---|---|
+| Dynamic BAR register behavior | `wr_*`, `rd_req_*`, `rd_rsp_*` in `pcileech_tlps128_bar_controller.sv` | Replace `i_bar0` with a BAR module that owns register state and side effects |
+| Device command/status state | BAR writes and core state in `clk_pcie` | Keep beside the BAR register owner and queue scheduler |
+| MRd/MWr generation | `IfAXIS128` TX sources in `pcileech_pcie_tlp_a7.sv` | Add one source to `pcileech_tlps128_sink_mux1` |
+| Completion consumption | Cpl/CplD classification in `pcileech_tlps128_filter` | Branch owned Tags to the request table before `pcileech_tlps128_dst_fifo` |
+| Tag and timeout table | 8-bit Tag in Completion header DWORD 2 | Add a `clk_pcie` free map and per-request metadata; do not use `pcileech_mux.sv` channel tags |
+| Descriptor queue | No existing driver-visible queue | Add BAR queue registers, descriptor fetch, consumer update, and completion state |
+| Engine interrupt | `ctx.cfg_interrupt*` in `pcileech_pcie_cfg_a7.sv` | Combine event and diagnostic requests at the current single signal owner |
+| Engine reset | `rst_subsys`, FLR, Hot Reset, and link state in `pcileech_pcie_a7.sv` | Form a local `clk_pcie` engine reset and clear every outstanding transaction |
+
+## Completion ownership
+
+The current filter recognizes Cpl and CplD from `tlps_in.tdata[31:25]` and forwards them as raw TLPs. The destination FIFO does not decode Completion Status, Byte Count, Lower Address, or the 8-bit Tag. A request engine therefore needs its own parser and an ownership test against the live Tag table. Packets with Tags outside that table continue to the existing system FIFO.
+
+For an owned read, retain the original address, total length, destination, received-byte count, and timeout age until the request is complete. Byte Count and Lower Address determine payload placement for the first CplD. A successful packet with the right Tag is not by itself proof that the whole Memory Read has completed.
+
+## Queue, interrupt, reset, and power state
+
+The existing Xilinx FIFOs are transport buffers, not descriptor rings. A driver-visible queue needs its own base, size, producer, consumer, enable, and doorbell behavior. Queue pointers and the request table should remain in `clk_pcie`; use an asynchronous FIFO for complete records that cross to `clk_sys`.
+
+The XCI enables MSI and disables MSI-X. The current interrupt source is local `rw[206]` in `pcileech_pcie_cfg_a7.sv`. An engine event must be routed to that owner and held until `ctx.cfg_interrupt_rdy`. MSI-X also requires a BAR table and PBA, neither of which appears in `pcileech_tlps128_bar_controller.sv`.
+
+`rst_subsys` includes board reset, PCIe `user_reset_out`, and the software subsystem reset. `ctx.cfg_received_func_lvl_rst` and `ctx.pl_received_hot_rst` are exposed but are not included in a custom engine reset because no such engine exists. New state must clear on those events, stop issuing on link loss, and observe `ctx.cfg_pmcsr_powerstate`. The PM control wires in `rw[208:214]` expose the core interface; they do not implement device D-state behavior.
+
+The `initial_rx` word in `pcileech_com.sv` brings the PCILeech transport out of its startup reset. Driver initialization is separate and must be derived from the actual BAR access sequence: queue programming, interrupt setup, enable/doorbell, ready status, DMA exchange, and acknowledgement.

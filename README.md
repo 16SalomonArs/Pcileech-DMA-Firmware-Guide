@@ -26,12 +26,23 @@ I wrote this for people starting from zero who still want to build **custom PCIL
 6. [Shadow Config](#6-shadow-config)
 7. [WriteMask](#7-writemask)
 8. [Capability layout](#8-capability-layout)
-9. [BAR implementation](#9-bar-implementation)
+9. [BAR implementation and device engine](#9-bar-implementation-and-device-engine)
+   - [Replace Zero4K with a dynamic BAR block](#91-replace-zero4k-with-a-dynamic-bar-block)
+   - [Add the device command/status state machine](#92-add-the-device-commandstatus-state-machine)
+   - [Add Memory Read and Memory Write generation](#93-add-memory-read-and-memory-write-generation)
+   - [Consume Completions and manage Tags](#94-consume-completions-and-manage-tags)
+   - [Fetch descriptors and run the queue](#95-fetch-descriptors-and-run-the-queue)
+   - [Connect MSI, then add MSI-X only if required](#96-connect-msi-then-add-msi-x-only-if-required)
+   - [Reset, FLR, link recovery, and power](#97-reset-flr-link-recovery-and-power)
+   - [Reproduce the driver initialization handshake](#98-reproduce-the-driver-initialization-handshake)
 10. [Project generation and build](#10-project-generation-and-build)
+    - [RTL simulation before build](#101-rtl-simulation-before-build)
 11. [Timing review](#11-timing-review)
 12. [BIT and BIN output](#12-bit-and-bin-output)
 13. [Flashing](#13-flashing)
 14. [Configuration-space and BAR checks](#14-configuration-space-and-bar-checks)
+    - [ILA probes](#141-ila-probes)
+    - [Hardware regression](#142-hardware-regression)
 15. [Common problems](#15-common-problems)
 16. [Linux supplement](#16-linux-supplement)
 17. [File and term reference](#17-file-and-term-reference)
@@ -217,29 +228,562 @@ The same file defines local `rw[20]` as status-register auto-clear enable and lo
 
 For a donor comparison, locate the PM capability through the standard chain and read PMCSR at `PM base + 0x04`. Check `ctx.cfg_pmcsr_powerstate`, `ctx.cfg_pmcsr_pme_en`, and `ctx.cfg_pmcsr_pme_status` in the core register bank. MSI is enabled by the pinned XCI and its state is visible through `ctx.cfg_interrupt_msienable`; MSI-X is disabled and the checked-in RTL has no MSI-X table or PBA implementation. The Command Register path is the core management path, not the shadow BRAM path.
 
-## 9. BAR implementation
+## 9. BAR implementation and device engine
 
-`src/pcileech_tlps128_bar_controller.sv` contains the request decoder, read engine, write engine, completion path, and three concrete BAR implementations:
+The existing BAR path is worth keeping. In `src/pcileech_tlps128_bar_controller.sv`, `pcileech_tlps128_bar_wrengine` already decodes Memory Write requests into `wr_bar`, `wr_addr`, `wr_be`, `wr_data`, and `wr_valid`. `pcileech_tlps128_bar_rdengine` turns a host Memory Read into DWORD requests, preserves Requester ID and Tag in `rd_req_ctx`, and returns one or more CplD packets through `tlps_bar_rsp`.
 
-- `pcileech_bar_impl_zerowrite4k`: 4 KB writable BRAM, two-clock read latency;
-- `pcileech_bar_impl_loopaddr`: returns the read address, two-clock latency;
-- `pcileech_bar_impl_none`: drops accesses and produces no completion.
+The stock BAR0 implementation, `pcileech_bar_impl_zerowrite4k`, is only a 4 KB byte-enabled RAM. Use it to prove MMIO transport first. Replace it when the driver starts expecting registers, commands, queue state, DMA, or interrupts.
 
-The checked-in controller connects Zero4K to BAR0 and loopback to BAR1. The XCI enables only BAR0, so the active stock path is Zero4K. Its initial contents come from `ip/pcileech_bar_zero4k.coe` through `bram_bar_zero4k.xci`.
+For that baseline, [`make_zero4k_coe.py`](coe-tools/make_zero4k_coe.py) builds the image from the [BAR0 DWORD CSV](coe-tools/examples/bar0_dwords.csv). Keep the known Zero4K image available while changing the register block; it separates BAR transport faults from device-state faults.
 
-Generate a 1024-DWORD BAR0 image with [`make_zero4k_coe.py`](coe-tools/make_zero4k_coe.py). The [BAR0 CSV fixture](coe-tools/examples/bar0_dwords.csv) shows the required offset/DWORD layout:
+Work in this order:
 
-```powershell
-python .\coe-tools\make_zero4k_coe.py .\coe-tools\examples\bar0_dwords.csv .\coe-tools\examples\pcileech_bar_zero4k.coe
+1. replace Zero4K with a dynamic BAR register block while preserving the two-clock read response;
+2. reproduce the driver's command/status transitions;
+3. add one outbound TLP source to the existing TX arbiter;
+4. add a Tag table and consume only the Completions owned by that table;
+5. fetch and retire descriptors;
+6. connect the event path to the existing MSI owner;
+7. reset the whole device engine on FLR, Hot Reset, and subsystem reset;
+8. run simulation before adding the driver.
+
+The [RTL ownership notes](firmware-notes/implementation-notes.md) list the existing modules and clock crossings used below.
+
+| File | Change made by this chapter |
+|---|---|
+| `src/pcileech_tlps128_bar_controller.sv` | Replace `i_bar0`; add dynamic registers, side effects, queue state, and the device scheduler |
+| `src/pcileech_pcie_tlp_a7.sv` | Add the DMA TX stream, Completion ownership, and the fifth TX-mux input |
+| `src/pcileech_pcie_a7.sv` | Route live Command, Device Control, PM, link, FLR, Hot Reset, and interrupt-event signals |
+| `src/pcileech_pcie_cfg_a7.sv` | Keep one owner for MSI, transaction-pending, and turnoff acknowledgement |
+| `src/pcileech_header.svh` | Extend an interface only if the added signals are not kept as explicit module ports |
+
+### 9.1 Replace Zero4K with a dynamic BAR block
+
+Keep the decoder and both BAR engines. In `src/pcileech_tlps128_bar_controller.sv`, replace only the module attached to `i_bar0`. The replacement uses the same ports:
+
+```systemverilog
+module pcileech_bar_impl_device(
+    input               rst,
+    input               clk,
+
+    input      [31:0]   wr_addr,
+    input      [3:0]    wr_be,
+    input      [31:0]   wr_data,
+    input               wr_valid,
+
+    input      [87:0]   rd_req_ctx,
+    input      [31:0]   rd_req_addr,
+    input               rd_req_valid,
+
+    output bit [87:0]   rd_rsp_ctx,
+    output bit [31:0]   rd_rsp_data,
+    output bit          rd_rsp_valid,
+
+    output bit          command_pulse,
+    output bit          queue_enable,
+    output bit [63:0]   queue_base,
+    output bit [15:0]   queue_size,
+    output bit [15:0]   producer_index,
+
+    input      [15:0]   consumer_index,
+    input      [31:0]   engine_status,
+    input               engine_done,
+    input               engine_error
+);
 ```
 
-Zero4K covers offsets `0x000` through `0xFFF`. Registers outside that range or state machines with device-specific side effects need corresponding RTL in the BAR controller. Keep every selected BAR implementation at the same read latency, as required by the shared response mux.
+Use symbolic offsets until the driver's BAR trace identifies the real addresses:
 
-The active memory-read path is:
+```systemverilog
+localparam [11:0] REG_CONTROL      = 12'h000;
+localparam [11:0] REG_STATUS       = 12'h004;
+localparam [11:0] REG_QUEUE_BASE_LO= 12'h008;
+localparam [11:0] REG_QUEUE_BASE_HI= 12'h00c;
+localparam [11:0] REG_QUEUE_SIZE   = 12'h010;
+localparam [11:0] REG_PRODUCER     = 12'h014;
+localparam [11:0] REG_CONSUMER     = 12'h018;
+localparam [11:0] REG_DOORBELL     = 12'h01c;
+```
 
-`pcileech_pcie_tlp_a7.sv` `tlps_rx` -> `pcileech_tlps128_bar_controller.sv` request decoder -> `rd_req_valid`, `rd_req_bar`, `rd_req_addr` -> `pcileech_bar_impl_zerowrite4k` -> `rd_rsp_valid`, `rd_rsp_data`, `rd_rsp_ctx` -> BAR response mux -> `pcileech_tlps128_bar_rdengine` -> `tlps_bar_rsp` -> `tlps_tx` Completion.
+Those values are a wiring example, not donor data. Replace each one with the offset read or written by the driver. Do the same for reset values and field definitions.
 
-The controller consumes one DWORD per clock. Reads use `rd_req_addr[11:2]`, so the Zero4K BRAM is DWORD-aligned and read responses carry the full DWORD; the source comments explicitly state that reads have no byte enable. Writes carry `wr_be` and `wr_data`, and Zero4K connects `wr_be` to BRAM `wea`. Zero4K and loopback both return data after two clocks; every implementation selected by the shared mux must preserve that latency.
+The write engine already converts an unaligned host access into a DWORD address and byte enables. Merge only enabled lanes:
+
+```systemverilog
+function automatic [31:0] apply_be(
+    input [31:0] old_value,
+    input [31:0] new_value,
+    input [3:0]  be
+);
+    integer lane;
+    begin
+        apply_be = old_value;
+        for (lane = 0; lane < 4; lane = lane + 1)
+            if (be[lane])
+                apply_be[lane*8 +: 8] = new_value[lane*8 +: 8];
+    end
+endfunction
+
+bit [31:0] control_reg;
+bit [31:0] status_reg;
+
+wire [31:0] write_lane_mask = {
+    {8{wr_be[3]}}, {8{wr_be[2]}}, {8{wr_be[1]}}, {8{wr_be[0]}}
+};
+```
+
+A register write and its side effect must be handled by the same address hit. This avoids a doorbell firing when its byte lane was not written:
+
+```systemverilog
+wire control_wr  = wr_valid && (wr_addr[11:0] == REG_CONTROL);
+wire status_wr   = wr_valid && (wr_addr[11:0] == REG_STATUS);
+wire doorbell_wr = wr_valid && (wr_addr[11:0] == REG_DOORBELL);
+
+always @(posedge clk) begin
+    if (rst) begin
+        queue_enable  <= 1'b0;
+        command_pulse <= 1'b0;
+    end else begin
+        command_pulse <= 1'b0;
+
+        if (control_wr) begin
+            control_reg <= apply_be(control_reg, wr_data, wr_be);
+            queue_enable <= wr_be[0] ? wr_data[0] : queue_enable;
+        end
+
+        if (doorbell_wr && wr_be[0] && wr_data[0])
+            command_pulse <= 1'b1;
+    end
+end
+```
+
+Do not implement W1C by storing the written value. Set status from hardware events, then clear only the enabled bits written as one:
+
+```systemverilog
+wire [31:0] status_set = {
+    30'b0, engine_error, engine_done
+};
+
+always @(posedge clk) begin
+    if (rst)
+        status_reg <= 32'h00000000;
+    else if (status_wr)
+        status_reg <= (status_reg &
+                      ~(wr_data & write_lane_mask)) |
+                      status_set;
+    else
+        status_reg <= status_reg | status_set;
+end
+```
+
+This ordering gives a hardware event priority over a simultaneous W1C acknowledgement, so a new event is not lost.
+
+The shared BAR read engine expects the implementation response after two clocks. Pipeline the address and context together:
+
+```systemverilog
+bit [87:0] rd_ctx_q;
+bit [11:0] rd_addr_q;
+bit        rd_valid_q;
+
+always @(posedge clk) begin
+    rd_ctx_q   <= rd_req_ctx;
+    rd_addr_q  <= rd_req_addr[11:0];
+    rd_valid_q <= rd_req_valid;
+
+    rd_rsp_ctx   <= rd_ctx_q;
+    rd_rsp_valid <= rd_valid_q;
+
+    case (rd_addr_q)
+        REG_CONTROL:       rd_rsp_data <= control_reg;
+        REG_STATUS:        rd_rsp_data <= status_reg | engine_status;
+        REG_QUEUE_BASE_LO: rd_rsp_data <= queue_base[31:0];
+        REG_QUEUE_BASE_HI: rd_rsp_data <= queue_base[63:32];
+        REG_QUEUE_SIZE:    rd_rsp_data <= {16'b0, queue_size};
+        REG_PRODUCER:      rd_rsp_data <= {16'b0, producer_index};
+        REG_CONSUMER:      rd_rsp_data <= {16'b0, consumer_index};
+        default:           rd_rsp_data <= 32'h00000000;
+    endcase
+end
+```
+
+If the donor uses read-clear, snapshot, or latch-on-read registers, apply that action when `rd_req_valid` and the matching address are accepted. Do not trigger it from `rd_rsp_valid`, because the response can be delayed while a later request is already entering the pipeline.
+
+### 9.2 Add the device command/status state machine
+
+The command state machine in `src/pcileech_fifo.sv` belongs to the FT601 control protocol. Leave it alone. Put driver-visible device state next to the BAR registers or in a new module appended to `src/pcileech_tlps128_bar_controller.sv`, all in `clk_pcie`.
+
+Route these existing core signals from `pcileech_pcie_a7.sv` through `pcileech_pcie_tlp_a7.sv`:
+
+```systemverilog
+input  [15:0] cfg_command;
+input  [15:0] cfg_dcommand;
+input  [15:0] cfg_dcommand2;
+input   [1:0] pm_power_state;
+input         link_up;
+input         flr;
+input         hot_reset;
+output        device_irq_req;
+```
+
+At the wrapper level, keep `ctx` as the source of core state and use one wire for the engine event:
+
+```systemverilog
+wire device_irq_req;
+
+pcileech_pcie_cfg_a7 i_pcileech_pcie_cfg_a7(
+    // existing ports...
+    .device_irq_req ( device_irq_req )
+);
+
+pcileech_pcie_tlp_a7 i_pcileech_pcie_tlp_a7(
+    // existing ports...
+    .cfg_command     ( ctx.cfg_command                 ),
+    .cfg_dcommand    ( ctx.cfg_dcommand                ),
+    .cfg_dcommand2   ( ctx.cfg_dcommand2               ),
+    .pm_power_state  ( ctx.cfg_pmcsr_powerstate        ),
+    .link_up         ( ctx.pl_phy_lnk_up               ),
+    .flr             ( ctx.cfg_received_func_lvl_rst   ),
+    .hot_reset       ( ctx.pl_received_hot_rst         ),
+    .device_irq_req  ( device_irq_req                  )
+);
+```
+
+Use `ctx.cfg_command[1]` for Memory Space Enable and `ctx.cfg_command[2]` for Bus Master Enable. Do not copy those values from the shadow BRAM. The Xilinx core owns the live Command Register and already exposes it as `ctx.cfg_command`.
+
+A small state machine is enough to control request issue:
+
+```systemverilog
+typedef enum logic [2:0] {
+    DEV_RESET,
+    DEV_IDLE,
+    DEV_READY,
+    DEV_FETCH_DESC,
+    DEV_RUN,
+    DEV_COMPLETE,
+    DEV_FAULT
+} device_state_t;
+
+wire mmio_enabled = cfg_command[1];
+wire bus_master   = cfg_command[2];
+wire power_d0     = (pm_power_state == 2'b00);
+wire can_run      = link_up && power_d0 && bus_master;
+
+always @(posedge clk_pcie) begin
+    if (engine_reset) begin
+        state <= DEV_RESET;
+    end else case (state)
+        DEV_RESET:
+            state <= DEV_IDLE;
+
+        DEV_IDLE:
+            if (mmio_enabled && queue_config_valid)
+                state <= DEV_READY;
+
+        DEV_READY:
+            if (command_pulse && queue_enable && can_run)
+                state <= DEV_FETCH_DESC;
+
+        DEV_FETCH_DESC:
+            if (descriptor_ready)
+                state <= DEV_RUN;
+            else if (request_error)
+                state <= DEV_FAULT;
+
+        DEV_RUN:
+            if (transfer_done)
+                state <= DEV_COMPLETE;
+            else if (request_error)
+                state <= DEV_FAULT;
+
+        DEV_COMPLETE:
+            if (completion_recorded)
+                state <= DEV_READY;
+
+        DEV_FAULT:
+            if (status_w1c_ack)
+                state <= DEV_READY;
+    endcase
+end
+```
+
+`queue_config_valid`, ready, busy, done, and error must match the actual driver-visible fields. Capture the first driver load and write down the order before assigning those bits. The important behavior is the transition: configuration writes first, enable or doorbell next, busy while requests are live, status or consumer update at retirement, then interrupt.
+
+### 9.3 Add Memory Read and Memory Write generation
+
+The pinned tree can transmit arbitrary TLP DWORDs from `dfifo.tx_*` and can send the eight-DWORD static packet in `pcileech_pcie_cfg_a7.sv`. Neither path schedules descriptors or owns Tags.
+
+Add an `IfAXIS128 tlps_dma()` stream in `src/pcileech_pcie_tlp_a7.sv`. Extend `pcileech_tlps128_sink_mux1` from four inputs to five. Preserve the current first three priorities and insert DMA before the static source:
+
+```text
+1  tlps_cfg_rsp
+2  tlps_bar_rsp
+3  tlps_rx_fifo
+4  tlps_dma
+5  tlps_static
+```
+
+The mux already holds a selected source until `tvalid && tlast`. Add `tlps_in5` to the port list, `has_data` expression, data selectors, `id_next_newsel`, and `tready` assignments. Do not connect a second driver directly to `tlps_tx`.
+
+The request generator needs these inputs:
+
+```systemverilog
+input      [15:0] requester_id;
+input      [15:0] cfg_dcommand;
+input      [63:0] request_addr;
+input      [31:0] request_length;
+input             request_is_write;
+input      [127:0] write_data;
+input      [15:0] write_keep;
+input             request_valid;
+output            request_ready;
+IfAXIS128.source  tlps_dma;
+```
+
+Decode the active limits from the real Device Control register:
+
+- `cfg_dcommand[7:5]`: Maximum Payload Size for Memory Write;
+- `cfg_dcommand[14:12]`: Maximum Read Request Size;
+- `cfg_dcommand[8]`: Extended Tag Field Enable.
+
+The byte limits decode as `128 << field_value`; clamp them to the limits configured into the generated core and to the buffer size implemented by the engine.
+
+Start with Tags 0 through 31. Use a larger pool only when Extended Tag is enabled and the generated core configuration supports it.
+
+For each fragment:
+
+```text
+bytes_to_4k = 4096 - request_addr[11:0]
+limit       = request_is_write ? max_payload_bytes : max_read_request_bytes
+fragment    = min(remaining_bytes, bytes_to_4k, limit)
+```
+
+The request must not cross a 4 KB boundary. Compute Length in DWORDs after accounting for the first and last partial DWORD. First Byte Enable comes from the start address and leading byte count; Last Byte Enable comes from the final DWORD. A one-DWORD request uses First Byte Enable and a zero Last Byte Enable.
+
+```systemverilog
+wire [1:0] start_lane = fragment_addr[1:0];
+wire [1:0] end_lane   =
+    (fragment_addr[1:0] + fragment_bytes - 1) & 2'b11;
+wire [10:0] fragment_dw =
+    (fragment_addr[1:0] + fragment_bytes + 3) >> 2;
+wire [9:0] length_field = (fragment_dw == 1024) ?
+                          10'b0000000000 : fragment_dw[9:0];
+
+wire [3:0] first_be_raw = 4'b1111 << start_lane;
+wire [3:0] last_be_raw  = 4'b1111 >> (3 - end_lane);
+wire [3:0] first_be = (fragment_dw == 1) ?
+                      (first_be_raw & last_be_raw) : first_be_raw;
+wire [3:0] last_be  = (fragment_dw == 1) ?
+                      4'b0000 : last_be_raw;
+```
+
+Reject a zero-length transfer before this calculation. PCIe encodes a Length field of zero as 1024 DWORDs, not as an empty request.
+
+Build the header in the same DWORD order used by `pcileech_tlps128_bar_rdengine` and `pcileech_cfgspace_pcie_tx`:
+
+| Header DWORD | Memory request fields |
+|---|---|
+| DW0 | Fmt, Type, traffic attributes, and Length |
+| DW1 | Requester ID, Tag, Last BE, First BE |
+| DW2 | 32-bit address, or upper 32 bits of a 64-bit address |
+| DW3 | lower 32 bits for a 4-DWORD header; otherwise the first payload DWORD |
+
+Use a 3-DWORD Memory Read/Write header below 4 GB and a 4-DWORD header above it. A Memory Write is posted: retire its TX fragment when the final beat is accepted by `tlps_dma.tready`. A Memory Read is non-posted: move it to the outstanding table after the header is accepted, then wait for Cpl/CplD.
+
+A practical TX state machine is:
+
+```text
+TX_IDLE
+  -> TX_ALLOC_TAG       Memory Read only
+  -> TX_HEADER
+  -> TX_PAYLOAD         Memory Write only
+  -> TX_FRAGMENT_DONE
+  -> TX_IDLE            no bytes left
+  -> TX_HEADER          next split fragment
+```
+
+Keep `tdata`, `tkeepdw`, `tlast`, and `tvalid` unchanged whenever `tvalid == 1` and `tready == 0`. Set `tuser[0]` on the first beat and `tuser[1]` with the last beat. The static source and BAR response code show the byte order expected by the existing 128-to-64 converter; compare the complete transmitted header in simulation before hardware use.
+
+### 9.4 Consume Completions and manage Tags
+
+`pcileech_tlps128_filter` already identifies Cpl and CplD with `tlps_in.tdata[31:25]`. It forwards them unchanged through `pcileech_tlps128_dst_fifo`; it does not parse status, own Tags, reassemble data, or time out requests.
+
+On the first beat of a Completion, the fields used by the request engine are:
+
+| Field | Existing 128-bit stream |
+|---|---|
+| Cpl/CplD type | `tlps_rx.tdata[31:25]` |
+| Length | `tlps_rx.tdata[9:0]` |
+| Completion Status | `tlps_rx.tdata[47:45]` |
+| Byte Count | `tlps_rx.tdata[43:32]` |
+| Requester ID | `tlps_rx.tdata[95:80]` |
+| Tag | `tlps_rx.tdata[79:72]` |
+| Lower Address | `tlps_rx.tdata[70:64]` |
+| First payload DWORD | `tlps_rx.tdata[127:96]` for CplD |
+
+Create a live table in `clk_pcie`. One entry per issued Memory Read is sufficient:
+
+```systemverilog
+typedef struct packed {
+    logic        valid;
+    logic [63:0] request_addr;
+    logic [31:0] total_bytes;
+    logic [31:0] received_bytes;
+    logic [15:0] descriptor_index;
+    logic [31:0] age;
+} tag_entry_t;
+
+tag_entry_t tag_table [0:31];
+logic [31:0] tag_free;
+wire  [31:0] tag_live = ~tag_free;
+```
+
+Allocation clears one bit in `tag_free` and writes the matching entry. Do not free the Tag when the first CplD arrives. Free it after `received_bytes == total_bytes`, or once after a non-success Completion or timeout has been committed to the descriptor error path.
+
+For each owned CplD:
+
+1. reject a Tag whose `valid` bit is clear;
+2. check Completion Status before accepting payload;
+3. verify Byte Count does not exceed the bytes still expected;
+4. use Lower Address to place the first payload byte;
+5. apply `tkeepdw` on every beat and append only valid payload DWORDs;
+6. increase `received_bytes` by accepted payload bytes;
+7. retire the request only after the complete byte count has arrived.
+
+Different Tags can complete out of order. Several CplD packets can complete one request. Keep descriptor completion separate from packet completion.
+
+Add a Tag-age counter or a shared timer scan. At timeout, mark the owning descriptor with an error and remove the request from normal completion accounting. Do not immediately reuse that Tag: a late Completion carries only the Tag, not a private generation number. Keep timed-out Tags in a quarantine bitmap until FLR/reset or until a guard interval longer than the accepted completion window has expired, and drop late packets that match the quarantine bitmap.
+
+Owned Completion packets should not also appear as ordinary FT601 RX traffic. Add an ownership input to `pcileech_tlps128_filter` and include it in `filter_next` for the whole packet. Ownership is true only when the first beat is Cpl/CplD and `tag_table[tag].valid` belongs to the device engine. Requests injected through `dfifo.tx_*` share the same PCIe Tag namespace; reserve disjoint Tag ranges or serialize those requests with the device engine.
+
+The 2-bit `p0_tag` through `p7_tag` values in `src/pcileech_mux.sv` are FT601 channel labels. They have no relationship to the 8-bit PCIe Tag.
+
+### 9.5 Fetch descriptors and run the queue
+
+The existing Xilinx FIFOs transport TLP beats and control words. They are not driver-visible descriptor queues.
+
+Use the BAR block for queue configuration:
+
+- queue base low and high;
+- ring size;
+- producer index written by the driver;
+- consumer index written by the engine;
+- enable;
+- doorbell;
+- interrupt mask or moderation fields when present in the driver ABI.
+
+Keep the register offsets, descriptor size, and field layout identical to the driver. A typical engine sequence is:
+
+```text
+driver writes queue base and size
+driver writes producer index
+driver rings doorbell
+engine validates base, size, producer, and Bus Master Enable
+engine issues MRd for descriptor[consumer]
+Completion parser assembles the descriptor
+engine validates address, length, direction, and flags
+engine performs data MRd/MWr fragments
+engine writes descriptor status if the ABI requires it
+engine advances consumer
+engine sets completion status and interrupt pending
+```
+
+Do not advance `consumer_index` when the descriptor is fetched. Advance it after every request owned by that descriptor has reached completion or a terminal error. For a ring of `queue_size` entries:
+
+```systemverilog
+wire queue_empty = (consumer_index == producer_index);
+wire [15:0] next_consumer =
+    (consumer_index + 1 == queue_size) ? 16'd0 : consumer_index + 1;
+```
+
+Reject a zero size, a producer outside the ring, an address alignment the descriptor format does not allow, and a transfer length larger than the implemented counter or buffer. Split descriptor fetches and data requests independently; a descriptor that crosses a 4 KB boundary still needs two Memory Reads.
+
+Keep the queue scheduler, Tag table, and TX source in `clk_pcie`. If payload data must move to `clk_sys`, cross a complete record through an asynchronous FIFO. Follow `fifo_134_134_clk2_rxfifo` for system-to-PCIe traffic and `fifo_134_134_clk2` for PCIe-to-system traffic. Do not cross a producer pointer, descriptor, or one-clock pulse by sampling it directly in the other domain.
+
+### 9.6 Connect MSI, then add MSI-X only if required
+
+The checked-in `ip/pcie_7x_0.xci` enables one 64-bit MSI vector and disables MSI-X. In `src/pcileech_pcie_cfg_a7.sv`, local `rw[206]` currently drives `ctx.cfg_interrupt`.
+
+Add one `device_irq_req` input to `pcileech_pcie_cfg_a7`. Replace the direct level assignment with a pending latch owned by this module:
+
+```systemverilog
+bit device_irq_pending;
+wire irq_ack = ctx.cfg_interrupt &&
+               ctx.cfg_interrupt_rdy;
+
+always @(posedge clk_pcie) begin
+    if (rst)
+        device_irq_pending <= 1'b0;
+    else case ({device_irq_req, irq_ack})
+        2'b10, 2'b11: device_irq_pending <= 1'b1;
+        2'b01:        device_irq_pending <= 1'b0;
+        default:      device_irq_pending <= device_irq_pending;
+    endcase
+end
+
+assign ctx.cfg_interrupt =
+    (device_irq_pending || rw[206]) &&
+    ctx.cfg_interrupt_msienable;
+```
+
+If `rw[206]` remains as a diagnostic request, self-clear it on `irq_ack`; otherwise a level left high can request another interrupt. Keep the pending status visible through the BAR register used by the driver. Masking an event stops transmission but does not discard the pending bit.
+
+For MSI-X, first enable it in the XCI and regenerate the PCIe IP. Then implement the table and Pending Bit Array at the BIR and offsets declared by the capability. Each vector needs address, data, and vector-control mask fields. Function mask and vector mask both suppress transmission; a suppressed event sets the matching PBA bit. When the vector is unmasked, issue it and clear the PBA bit only after the core accepts the interrupt. The stock Zero4K BAR is not an MSI-X table implementation.
+
+### 9.7 Reset, FLR, link recovery, and power
+
+`src/pcileech_pcie_a7.sv` currently defines:
+
+```systemverilog
+wire rst_subsys = rst || rst_pcie_user ||
+                  dfifo_pcie.pcie_rst_subsys;
+wire rst_pcie   = rst || ~pcie_perst_n ||
+                  dfifo_pcie.pcie_rst_core;
+```
+
+The core also exposes `ctx.cfg_received_func_lvl_rst`, `ctx.pl_received_hot_rst`, `ctx.pl_phy_lnk_up`, `ctx.pl_ltssm_state`, `ctx.cfg_pcie_link_state`, and `ctx.cfg_pmcsr_powerstate`.
+
+Form a synchronous device-engine reset in `clk_pcie`:
+
+```systemverilog
+wire engine_reset =
+    rst_subsys ||
+    ctx.cfg_received_func_lvl_rst ||
+    ctx.pl_received_hot_rst;
+```
+
+On `engine_reset`:
+
+- clear the Tag live map and timeout state;
+- discard partial Completion and descriptor assembly;
+- clear queue enable, consumer ownership, and doorbell pulses;
+- drop pending device interrupts;
+- restore dynamic BAR reset values;
+- return TX and device state machines to idle.
+
+Link loss is not a reason to keep issuing. Stop new requests as soon as `ctx.pl_phy_lnk_up` drops. Clear transport state that cannot survive retraining, then wait for link-up and the driver's queue programming before accepting another doorbell. The `STARTUPE2` global reset in `pcileech_fifo.sv` reloads the FPGA and is not FLR handling.
+
+`ctx.cfg_pmcsr_powerstate == 2'b00` is D0. Outside D0, stop fetching descriptors and requesting interrupts. Decide from the driver/device behavior whether in-flight work drains or aborts before D3. Drive `ctx.cfg_trn_pending` while transactions are still owned and assert `ctx.cfg_turnoff_ok` only when the engine is ready for the requested power transition. The existing `rw[208:214]` controls expose the core PM pins; they do not provide this device state machine.
+
+### 9.8 Reproduce the driver initialization handshake
+
+The `initial_rx` word in `src/pcileech_com.sv` releases the PCILeech transport from startup reset. It is separate from a Windows driver's device initialization.
+
+Capture the first successful driver start and annotate every BAR access in order:
+
+1. Command Register reaches the required Memory Space and Bus Master state.
+2. The driver maps BAR0 and reads identity, version, or capability registers.
+3. Queue base and size registers are written.
+4. Producer and consumer state is initialized.
+5. MSI or MSI-X is configured and unmasked.
+6. The driver writes enable or rings the first doorbell.
+7. The device sets busy or clears ready.
+8. Descriptor fetch and payload DMA complete.
+9. The device updates status or consumer state.
+10. The interrupt is acknowledged and status is cleared.
+
+Implement the same dependencies. Do not assert ready immediately after enumeration. Reject a doorbell until every required queue field is valid, Bus Master Enable is set, the link is up, and the function is in D0. If the driver polls before enabling interrupts, update status before requesting MSI. If it acknowledges with W1C, keep the event set until that exact write is received.
+
+Use ILA in two passes. First capture `wr_valid`, `wr_addr`, `wr_be`, `wr_data`, state, and BAR readback to finish the register handshake. Then capture the DMA TX header, live Tag, CplD header, received byte count, consumer update, `device_irq_pending`, `ctx.cfg_interrupt`, and `ctx.cfg_interrupt_rdy`. Driver load is complete only when this whole chain reaches the expected final state.
 
 ## 10. Project generation and build
 
@@ -276,6 +820,60 @@ puts [get_property STATUS [get_runs impl_1]]
 ```
 
 The generator creates the project below the board directory. `vivado_build.tcl` launches `synth_1`, then `impl_1` through `write_bitstream`, waits for both runs, and copies the generated BIN file back to the board directory.
+
+### 10.1 RTL simulation before build
+
+The CaptainDMA profiles at the pinned revision do not include a device-engine testbench. Add the testbench to the Vivado simulation set in the same working tree as the RTL under test; do not treat the synthesis run as protocol verification.
+
+Start with the BAR block by itself. Drive `wr_*` and `rd_req_*` directly, keep a two-entry queue of expected `rd_req_ctx` values, and compare each one when `rd_rsp_valid` arrives. Then place the request engine behind an `IfAXIS128` sink that can deassert `tready` for arbitrary intervals. The Completion driver sends complete 128-bit beats with the same `tuser[0]`, `tlast`, and `tkeepdw` convention used by `pcileech_tlps128_dst_fifo`.
+
+Run the transaction sequence in a fixed order:
+
+1. hold reset across several `clk_pcie` edges and check that queue, Tag, TX, interrupt, and status state is empty;
+2. write every BAR register once with `wr_be` values `0001`, `0010`, `0100`, `1000`, and `1111`, then read it back through the two-clock path;
+3. write the doorbell with its byte disabled and confirm that no command pulse appears;
+4. ring the doorbell with Bus Master Enable clear and confirm that the TX source remains idle;
+5. enable bus mastering, issue one MRd, capture its Tag, and return one CplD with matching Requester ID, Tag, Byte Count, and Lower Address;
+6. issue several MRds and return their CplD packets in a different Tag order, splitting at least one request across two packets;
+7. withhold a Completion until timeout, send it late, and confirm that the quarantined Tag is not attached to a later request;
+8. hold `tready` low in the middle of a header and payload and compare every output signal for stability;
+9. complete a descriptor, delay `cfg_interrupt_rdy`, and confirm that the pending event survives until acknowledgement;
+10. assert FLR and Hot Reset while requests are live and check that no old Tag, descriptor, packet beat, or interrupt remains afterward.
+
+Useful assertions at the module boundary are:
+
+```systemverilog
+assert property (@(posedge clk_pcie)
+    tlps_dma.tvalid && !tlps_dma.tready |=>
+    tlps_dma.tvalid && $stable({tlps_dma.tdata,
+                               tlps_dma.tkeepdw,
+                               tlps_dma.tlast,
+                               tlps_dma.tuser}));
+
+assert property (@(posedge clk_pcie)
+    tag_allocate |-> tag_free[tag_allocate_value]);
+
+assert property (@(posedge clk_pcie)
+    engine_reset |=> !(|tag_live) &&
+                      !device_irq_pending &&
+                      !tlps_dma.tvalid);
+```
+
+Use a scoreboard for BAR latency and Completion byte placement. It should compare the full `rd_req_ctx`, request address, Tag, expected destination offset, accepted payload bytes, and final descriptor result rather than checking only a done flag.
+
+Exercise these cases before implementation:
+
+| Area | Required stimulus and check |
+|---|---|
+| BAR registers | Full and partial byte enables, unaligned host writes as decoded by the write engine, W1C status, doorbell pulse width, read side effects, and the two-clock `rd_req_valid` to `rd_rsp_valid` pipeline |
+| Memory Write | 32-bit and 64-bit addresses, first/last byte enables, maximum payload split, 4 KB boundary split, and `tvalid` stability under TX backpressure |
+| Memory Read | Multiple live Tags, exhausted Tag pool, read-request split, and no issue while Bus Master Enable is clear |
+| Completion | CplD split into several packets, different Tags returned out of order, non-success status, duplicate data, wrong Byte Count, and timeout release |
+| Queue | Producer/consumer wrap, invalid descriptor length, doorbell while disabled, descriptor completion ordering, and backpressure at every FIFO boundary |
+| Interrupt | MSI disabled, delayed `cfg_interrupt_rdy`, coalesced pending events, and no lost event during acknowledgement |
+| Reset and power | FLR, Hot Reset, link loss during a request, D3 entry with work pending, return to D0, and reinitialization before a new doorbell |
+
+For the TLP checks, compare complete headers and payload bytes, not only `tvalid`. Assert that a Tag is never issued twice, every accepted MRd reaches completion or timeout exactly once, and reset leaves no request or interrupt pending.
 
 ## 11. Timing review
 
@@ -331,6 +929,10 @@ Start with Device Manager and an offset-aware PCI configuration viewer.
 4. Read BAR0 at `0x000`, another populated DWORD, and `0xFFC`.
 5. Write only fields enabled by the WriteMask, then read them back.
 6. Re-read the command register and the MSI control field after Windows configures the device.
+7. Compare the driver's first BAR writes with the implemented command/status transition.
+8. Check one DMA read and one DMA write with byte-for-byte comparison in a driver-owned buffer.
+9. Verify Tag retirement, timeout behavior, queue movement, and interrupt acknowledgement separately.
+10. Repeat the initialization after FLR or the reset sequence supported by the driver.
 
 Enumeration proves that the endpoint trained and answered configuration requests. BAR completion proves that the selected MMIO path responds. Driver operation adds device-specific behavior beyond both checks.
 
@@ -343,8 +945,26 @@ The checked-in project has no ILA instance. When adding one to a generated proje
 | Config write | `pcie_rx_wren`, `pcie_rx_addr`, `pcie_rx_data`, `pcie_rx_be`, `bram_wr_be`, `bram_rd_data_z`, `tlps_cfg_rsp.tvalid` |
 | BAR read | `tlps_in.tvalid`, `tlps_in.tlast`, `tlps_in.tdata`, `in_is_bar`, `rd_req_valid`, `rd_req_bar`, `rd_req_addr`, `rd_rsp_valid`, `rd_rsp_data`, `bar_rsp_valid[0]` |
 | Interrupt | `ctx.cfg_interrupt`, `ctx.cfg_interrupt_assert`, `ctx.cfg_interrupt_rdy`, `ctx.cfg_interrupt_msienable`, `ctx.cfg_interrupt_msixenable` |
+| Raw Completion receive | `is_tlphdr_cpl`, `tlps_filtered.tvalid`, `tlps_filtered.tdata`, `dfifo.rx_valid`, `dfifo.rx_data` |
+| Reset and link | `rst_subsys`, `rst_pcie_user`, `ctx.cfg_received_func_lvl_rst`, `ctx.pl_received_hot_rst`, `ctx.pl_phy_lnk_up`, `ctx.pl_ltssm_state` |
 
 For a config write, trigger on `pcie_rx_wren` and compare `pcie_rx_be` with the WriteMask result. For a BAR read, trigger on `rd_req_valid` and require a matching `rd_rsp_valid` after the implementation latency. For MSI, trigger on `ctx.cfg_interrupt` and inspect the ready and enable signals together.
+
+### 14.2 Hardware regression
+
+Run the [hardware regression record](firmware-notes/templates.md#hardware-regression-record) from a cold power cycle. Keep the configuration and BAR captures from the same boot.
+
+1. Confirm link training and enumerate the function before loading the driver.
+2. Walk both capability chains, then compare Command, PMCSR, MSI control, BAR type, and BAR aperture with the captured device state.
+3. Load the driver and record the initial BAR transaction order. The ready transition must follow the required queue and interrupt programming.
+4. Read and write each dynamic BAR class: plain RW, RO, W1C, doorbell, and any read-side-effect register. Repeat partial-byte writes.
+5. Use a driver-owned test buffer for one DMA read and one DMA write. Compare all bytes and cover a request that splits at the configured limit and at a 4 KB boundary.
+6. Keep several reads outstanding, then check Tag reuse, split Completion assembly, timeout reporting, and queue consumer movement.
+7. Trigger each implemented interrupt source and confirm one acknowledgement per pending event. Repeat with MSI disabled; add the table-mask and PBA cases only when MSI-X is implemented.
+8. Exercise FLR, driver disable/enable, link retrain, and the supported power transition. After each event, verify that stale Tags, descriptors, and pending interrupts are gone before the driver reinitializes the device.
+9. Repeat the cold-start and warm-reset sequence used for release testing, then retain the ILA captures and Vivado reports with the matching image.
+
+Enumeration, BAR readback, DMA data integrity, interrupt delivery, and reset recovery are separate results. Record each one independently; a successful earlier stage does not establish a later stage.
 
 ## 15. Common problems
 
@@ -410,6 +1030,12 @@ Use the [file and PCIe term reference](firmware-notes/reference.md) when matchin
 | Shadow controls | `src/pcileech_fifo.sv` |
 | Config TLP decode and BRAM mux | `src/pcileech_tlps128_cfgspace_shadow.sv` |
 | DSN, config-management controls, interrupt pins | `src/pcileech_pcie_cfg_a7.sv` |
+| PCIe wrapper, reset, link, and PM signals | `src/pcileech_pcie_a7.sv` |
+| RX filter, clock crossings, and TX arbitration | `src/pcileech_pcie_tlp_a7.sv` |
+| TLP, core, FIFO, and shadow interfaces | `src/pcileech_header.svh` |
+| FT601 command and raw TLP routing | `src/pcileech_fifo.sv` |
+| Communications clock crossing | `src/pcileech_com.sv` |
+| FT601 output-channel mux | `src/pcileech_mux.sv` |
 | BAR request, response, and implementations | `src/pcileech_tlps128_bar_controller.sv` |
 | Zero4K contents | `ip/pcileech_bar_zero4k.coe` |
 | Board pins and clocks | board-specific `.xdc` under `src/` |

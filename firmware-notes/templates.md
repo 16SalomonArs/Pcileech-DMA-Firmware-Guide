@@ -48,3 +48,26 @@ BAR0 + 0x000 |      |              |
 BAR0 + 0x004 |      |              |
 BAR0 + 0xFFC |      |              |
 ```
+
+## Hardware regression record
+
+Keep one row per image and attach the matching config dump, BAR trace, ILA capture, timing report, and flash output.
+
+```text
+Image / BIN SHA-256:
+Board profile / FPGA part:
+Vivado report set:
+Cold enumeration:
+Capability / Command / PMCSR readback:
+Dynamic BAR byte-enable and side-effect checks:
+DMA read data comparison:
+DMA write data comparison:
+Split Completion / Tag / timeout checks:
+Queue wrap and descriptor completion:
+MSI acknowledgement:
+MSI-X table, mask, and PBA checks:
+FLR / Hot Reset / link recovery:
+Power-state transition:
+Driver initialization sequence:
+Attached capture paths:
+```

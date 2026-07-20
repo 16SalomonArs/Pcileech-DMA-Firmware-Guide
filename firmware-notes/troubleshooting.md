@@ -22,6 +22,16 @@ Find the first layer that diverges. A driver symptom is not a reason to change t
 | BAR0 works only below `0x1000` | `pcileech_bar_impl_zerowrite4k` address range | Add the required RTL or keep the device within the 4 KB model |
 | MSI configuration does not match the donor | XCI MSI fields and capability readback | Align the PCIe IP and WriteMask at the donor offset |
 | MSI-X is present unexpectedly | `MSIx_Enabled` in `ip/pcie_7x_0.xci` | Keep it disabled unless a table/PBA implementation is part of the RTL |
+| A Memory Read never completes | Issued Tag, Cpl/CplD Tag, Completion Status, Byte Count, Lower Address, and timeout counter | Keep the Tag live until all requested bytes arrive or the request enters its timeout path |
+| Read data is shifted after a split Completion | Original address, first byte enable, Lower Address, Byte Count, and bytes already received | Place the first returned byte from Lower Address and advance by accepted payload bytes |
+| The Tag pool eventually stalls | Free bitmap, request table, timeout terminal state, and reset cleanup | Release a Tag once at full completion or terminal error; clear all live entries on the engine reset event |
+| Queue consumer stops moving | Producer/consumer indices, ring size, descriptor status, request table, and completion event | Advance the consumer after all work for that descriptor is complete, not when it is fetched |
+| Doorbell works only on a full DWORD write | `wr_addr`, `wr_be`, `wr_data`, and the doorbell byte lane | Decode the enabled byte lane and generate a single-cycle side effect from the accepted BAR write |
+| DMA starts before the driver is ready | `ctx.cfg_command`, queue-valid state, power state, link state, and enable write | Require the complete initialization handshake and Bus Master Enable before issuing a request |
+| MSI repeats or disappears under backpressure | Pending-event latch, `ctx.cfg_interrupt`, and `ctx.cfg_interrupt_rdy` | Keep the event pending until the core acknowledges it and clear it once on that handshake |
+| FLR leaves an old descriptor active | `ctx.cfg_received_func_lvl_rst`, queue state, Tag table, and pending interrupt | Include FLR in the device-engine reset event and require queue programming again |
+| Link retrains but DMA remains stopped | `ctx.pl_phy_lnk_up`, `ctx.pl_ltssm_state`, queue-valid state, and driver writes | Stop on link loss, clear transport state, then wait for link and driver reinitialization |
+| D3 entry leaves requests in flight | `ctx.cfg_pmcsr_powerstate`, `ctx.cfg_trn_pending`, queue issue, and interrupt state | Stop new work before the transition and apply the device's defined drain or abort behavior |
 | WNS/TNS or endpoint checks fail | `reports/timing_summary.rpt` and `reports/check_timing.rpt` | Fix clocks, constraints, or RTL before flashing |
 | CH347 cannot identify the board | Physical board, adapter orientation, driver, and image profile | Return to the stock image and the exact board directory |
 | Windows sees an old image after a power cycle | BIN path and flash-tool operation | Confirm the programmer wrote persistent flash, then power-cycle again |
